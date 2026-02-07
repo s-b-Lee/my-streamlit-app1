@@ -294,7 +294,9 @@ def openai_vision_analyze_style_with_fallback(
 # OpenAI Images API (optional) with fallback
 # -----------------------------
 def _post_images(api_key: str, payload: Dict[str, Any], timeout: int = 120) -> requests.Response:
-    url = "https://api.openai.com/v1/images"
+    # ✅ 오류 수정: 404 원인 = 잘못된 엔드포인트
+    #   올바른 이미지 생성 엔드포인트로 변경
+    url = "https://api.openai.com/v1/images/generations"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     return requests.post(url, headers=headers, json=payload, timeout=timeout)
 
@@ -324,12 +326,12 @@ def generate_outfit_image_with_fallback(
             "model": model,
             "prompt": prompt,
             "size": size,
+            # b64_json 응답을 기대 (기본)
         }
         try:
             r = _post_images(api_key, payload, timeout=180)
             if r.status_code == 200:
                 j = r.json()
-                # images endpoint typically returns data[0].b64_json
                 b64_png = j["data"][0].get("b64_json")
                 if not b64_png:
                     raise RuntimeError("이미지 응답에서 b64_json을 찾지 못했어요.")
@@ -832,7 +834,7 @@ with colr1:
                         timeout=90,
                     )
                     st.session_state["style_report"] = report
-                    st.session_state["outfit_images"] = []  # 리포트 새로 만들면 코디 이미지도 리셋
+                    st.session_state["outfit_images"] = []
                     st.success(f"리포트 생성 완료! (사용 모델: {used_model})")
                 except Exception as e:
                     st.error(f"리포트 생성 오류: {e}")
@@ -853,7 +855,6 @@ if st.session_state.get("style_report"):
     st.markdown(f"- 분위기 요약: {mini.get('mood_summary','')}")
     st.markdown(f"- 타인 인상: {mini.get('impression','')}")
 
-    # ✅ 요구사항 반영: 어울리는 상황을 구체적으로 표시 (x가 아니라 실제 값)
     best = mini.get("best_contexts") or []
     if best:
         st.markdown("- 어울리는 상황:")
@@ -887,7 +888,6 @@ if st.session_state.get("style_report"):
         st.markdown("#### 👗 패션")
         st.markdown(f"- 실루엣: {f.get('silhouette','')}")
 
-        # ✅ 요구사항 반영: 색채 설명 시 "색을 보여주기" (스와치 렌더)
         palette = f.get("color_palette") or []
         avoid = f.get("avoid_colors") or []
         if palette:
@@ -904,7 +904,6 @@ if st.session_state.get("style_report"):
     if b.get("daily_habits"):
         st.markdown("- 작은 습관:\n" + "\n".join([f"  - {x}" for x in b.get("daily_habits", [])]))
 
-    # ✅ 요구사항 반영: 예시 코디를 시각적으로 보여주기
     st.divider()
     st.subheader("🧥 예시 코디 (텍스트 + 시각화)")
 
@@ -930,7 +929,6 @@ if st.session_state.get("style_report"):
         st.markdown("#### 🎨 코디 시각화(이미지 생성)")
         st.caption("선택한 예시 코디를 ‘룩북 스타일’로 간단히 시각화합니다. (브랜드 로고/문구 없이)")
 
-        # 시각화할 코디 선택
         titles = [(ex or {}).get("title", f"코디 {i+1}") for i, ex in enumerate(outfit_examples[:6])]
         pick_idx = st.selectbox("시각화할 코디 선택", list(range(len(titles))), format_func=lambda x: titles[x], index=0)
 
@@ -944,8 +942,11 @@ if st.session_state.get("style_report"):
                 point = (ex or {}).get("point", "")
                 refs = (ex or {}).get("palette_refs", []) or []
 
-                # 팔레트에서 hex를 찾아서 프롬프트에 넣기
-                palette_map = {c.get("name"): c.get("hex") for c in (guide.get("fashion", {}) or {}).get("color_palette", []) if isinstance(c, dict)}
+                palette_map = {
+                    c.get("name"): c.get("hex")
+                    for c in (guide.get("fashion", {}) or {}).get("color_palette", [])
+                    if isinstance(c, dict)
+                }
                 ref_hex = [f"{n}:{palette_map.get(n)}" for n in refs if palette_map.get(n)]
 
                 img_prompt = (
