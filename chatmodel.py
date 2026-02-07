@@ -1,7 +1,6 @@
 # app.py
 import base64
 import json
-import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -17,11 +16,10 @@ st.set_page_config(
 )
 
 # -----------------------------
-# Constants / Config
+# Constants
 # -----------------------------
 PINTEREST_BASE = "https://api.pinterest.com/v5"
 
-# ✅ 요구사항 반영: 추구미 선택 키워드(고정 리스트)
 STYLE_KEYWORDS = [
     "세련됨",
     "우아함",
@@ -53,18 +51,19 @@ PINTEREST_NOTE = (
     "사용 불가(403 등)면 앱에서 안내 문구가 표시됩니다."
 )
 
-# ✅ 모델 오류 보완:
-# - gpt-4-mini 대신 접근 가능성이 높은 후보들을 순차 시도
-# - 첫 성공 모델을 세션에 캐시해서 다음 호출부터 사용
+# 모델 후보: 접근 불가 모델이면 자동으로 다음 후보로 넘어감
 MODEL_CANDIDATES_DEFAULT = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"]
+
+# 이미지 생성 후보(권한/정책에 따라 실패할 수 있어 fallback 처리)
+IMAGE_MODEL_CANDIDATES_DEFAULT = ["gpt-image-1"]
 
 
 # -----------------------------
-# Session State Init
+# Session State
 # -----------------------------
 def init_state():
     defaults = {
-        "style_messages": [],  # 추구미 챗봇 대화
+        "style_messages": [],
         "style_inputs": {
             "keywords": [],
             "text_like": "",
@@ -75,12 +74,13 @@ def init_state():
             "uploaded_image_analysis": None,
         },
         "style_report": None,
-        "style_self_checklist": "",
         "pinterest_cache": {},
         "pinterest_last_term": "",
         "pinterest_suggested_queries": [],
         "pinterest_negative_terms": [],
-        "working_model": None,  # 마지막으로 성공한 모델
+        "working_model": None,
+        "working_image_model": None,
+        "outfit_images": [],  # [{title, b64, prompt}]
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -91,7 +91,7 @@ init_state()
 
 
 # -----------------------------
-# OpenAI REST (Chat Completions) with fallback
+# OpenAI REST helpers (Chat Completions) with fallback
 # -----------------------------
 def _post_chat_completions(api_key: str, payload: Dict[str, Any], timeout: int = 90) -> requests.Response:
     url = "https://api.openai.com/v1/chat/completions"
@@ -109,15 +109,7 @@ def _is_model_access_error(msg: str) -> bool:
     )
 
 
-def _try_models(
-    api_key: str,
-    build_payload_fn,
-    model_candidates: List[str],
-    timeout: int,
-) -> Tuple[str, Dict[str, Any]]:
-    """
-    model_candidates를 순차 시도해 첫 성공 모델과 응답 JSON 반환.
-    """
+def _try_models(api_key: str, build_payload_fn, model_candidates: List[str], timeout: int) -> Tuple[str, Dict[str, Any]]:
     last_err_msg = ""
     for model in model_candidates:
         payload = build_payload_fn(model)
@@ -126,18 +118,14 @@ def _try_models(
             if r.status_code == 200:
                 return model, r.json()
 
-            # 오류 파싱
             try:
                 err = r.json()
                 last_err_msg = err.get("error", {}).get("message", r.text)
             except Exception:
                 last_err_msg = r.text
 
-            # 모델 접근 오류면 다음 후보 시도
             if _is_model_access_error(last_err_msg):
                 continue
-
-            # 그 외 오류는 즉시 중단
             raise RuntimeError(last_err_msg)
 
         except requests.exceptions.Timeout:
@@ -145,7 +133,6 @@ def _try_models(
         except requests.exceptions.RequestException:
             raise RuntimeError("네트워크 오류가 발생했어요. 잠시 후 다시 시도해 주세요.")
 
-    # 후보를 다 돌았는데도 모델 접근 문제만 반복된 경우
     raise RuntimeError(
         "사용 가능한 모델을 찾지 못했어요. (모델 접근 권한/조직 정책/키 설정을 확인해 주세요)\n"
         f"- 마지막 오류: {last_err_msg}"
@@ -159,9 +146,6 @@ def openai_stream_chat_with_fallback(
     model_candidates: List[str],
     temperature: float = 0.6,
 ) -> Tuple[str, str]:
-    """
-    스트리밍 응답: (full_text, used_model)
-    """
     used_model = st.session_state.get("working_model")
     candidates = [used_model] + model_candidates if used_model else model_candidates
 
@@ -173,7 +157,6 @@ def openai_stream_chat_with_fallback(
             "messages": [{"role": "system", "content": system_prompt}] + messages,
         }
 
-    # 스트리밍은 모델 후보를 하나씩 시도하면서 성공하면 스트림 처리
     last_err_msg = ""
     for model in candidates:
         payload = build_payload(model)
@@ -209,7 +192,6 @@ def openai_stream_chat_with_fallback(
                         except Exception:
                             continue
 
-                # 성공 모델 캐시
                 st.session_state["working_model"] = model
                 return full_text, model
 
@@ -218,10 +200,7 @@ def openai_stream_chat_with_fallback(
         except requests.exceptions.RequestException:
             raise RuntimeError("네트워크 오류가 발생했어요. 잠시 후 다시 시도해 주세요.")
 
-    raise RuntimeError(
-        "스트리밍에 사용할 수 있는 모델을 찾지 못했어요.\n"
-        f"- 마지막 오류: {last_err_msg}"
-    )
+    raise RuntimeError("스트리밍에 사용할 수 있는 모델을 찾지 못했어요.\n" f"- 마지막 오류: {last_err_msg}")
 
 
 def openai_json_with_fallback(
@@ -260,8 +239,6 @@ def openai_vision_analyze_style_with_fallback(
     model_candidates: List[str],
 ) -> Tuple[Dict[str, Any], str]:
     b64 = base64.b64encode(image_bytes).decode("utf-8")
-    # 업로드 확장자 무관하게 data URL은 jpeg로 넣어도 대부분 문제 없지만,
-    # png도 안전하게 처리하고 싶으면 업로드 타입을 검사해 mime을 바꿔도 됨.
     data_url = f"data:image/jpeg;base64,{b64}"
 
     system_prompt = (
@@ -311,6 +288,70 @@ def openai_vision_analyze_style_with_fallback(
     st.session_state["working_model"] = model
     content = resp["choices"][0]["message"]["content"]
     return json.loads(content), model
+
+
+# -----------------------------
+# OpenAI Images API (optional) with fallback
+# -----------------------------
+def _post_images(api_key: str, payload: Dict[str, Any], timeout: int = 120) -> requests.Response:
+    url = "https://api.openai.com/v1/images"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    return requests.post(url, headers=headers, json=payload, timeout=timeout)
+
+
+def _is_image_model_access_error(msg: str) -> bool:
+    if not msg:
+        return False
+    m = msg.lower()
+    return ("model" in m) and ("does not exist" in m or "do not have access" in m or "not found" in m)
+
+
+def generate_outfit_image_with_fallback(
+    api_key: str,
+    prompt: str,
+    image_model_candidates: List[str],
+    size: str = "1024x1024",
+) -> Tuple[str, str]:
+    """
+    Returns (b64_png, used_image_model)
+    """
+    used_model = st.session_state.get("working_image_model")
+    candidates = [used_model] + image_model_candidates if used_model else image_model_candidates
+
+    last_err = ""
+    for model in candidates:
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "size": size,
+        }
+        try:
+            r = _post_images(api_key, payload, timeout=180)
+            if r.status_code == 200:
+                j = r.json()
+                # images endpoint typically returns data[0].b64_json
+                b64_png = j["data"][0].get("b64_json")
+                if not b64_png:
+                    raise RuntimeError("이미지 응답에서 b64_json을 찾지 못했어요.")
+                st.session_state["working_image_model"] = model
+                return b64_png, model
+
+            try:
+                err = r.json()
+                last_err = err.get("error", {}).get("message", r.text)
+            except Exception:
+                last_err = r.text
+
+            if _is_image_model_access_error(last_err):
+                continue
+            raise RuntimeError(last_err)
+
+        except requests.exceptions.Timeout:
+            raise RuntimeError("이미지 생성 요청 시간이 초과됐어요. 다시 시도해 주세요.")
+        except requests.exceptions.RequestException:
+            raise RuntimeError("이미지 생성 중 네트워크 오류가 발생했어요.")
+
+    raise RuntimeError(f"이미지 생성 모델을 사용할 수 없어요.\n- 마지막 오류: {last_err}")
 
 
 # -----------------------------
@@ -368,14 +409,47 @@ def pinterest_search_partner_pins(
 
 
 # -----------------------------
-# Prompt builders (추구미)
+# UI helpers
+# -----------------------------
+def render_color_swatches(colors: List[Dict[str, str]], title: str = "컬러 팔레트"):
+    """
+    colors: [{"name": "...", "hex": "#AABBCC"}, ...]
+    """
+    if not colors:
+        st.caption("표시할 컬러 정보가 없어요.")
+        return
+
+    st.markdown(f"**{title}**")
+    cols = st.columns(min(6, len(colors)))
+    for i, c in enumerate(colors):
+        name = (c or {}).get("name", "") or "color"
+        hx = (c or {}).get("hex", "") or "#CCCCCC"
+        with cols[i % len(cols)]:
+            st.markdown(
+                f"""
+                <div style="border:1px solid #e5e7eb; border-radius:14px; padding:10px;">
+                  <div style="height:44px; border-radius:10px; background:{hx};"></div>
+                  <div style="margin-top:8px; font-weight:700;">{name}</div>
+                  <div style="font-size:12px; opacity:0.75;">{hx}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+# -----------------------------
+# Prompts
 # -----------------------------
 def style_report_prompt(style_inputs: Dict[str, Any]) -> Tuple[str, str]:
     system_prompt = (
         "당신은 '추구미 도우미'입니다. "
         "사용자의 선택 키워드/텍스트/이미지 분석(선택)을 바탕으로 추구미 리포트와 실천 가이드를 생성하세요. "
         "브랜드/제품 추천 금지(방향성만). "
-        "과장하지 말고 구조적으로. 반드시 JSON으로만 답하세요."
+        "과장하지 말고 구조적으로. 반드시 JSON으로만 답하세요.\n\n"
+        "중요:\n"
+        "- best_contexts(어울리는 상황)는 절대 'x' 같은 자리표시자가 아니라, 한국어로 구체적인 상황 4~7개를 제시하세요.\n"
+        "- color_palette/avoid_colors는 각 색을 name + hex(#RRGGBB)로 제공하세요.\n"
+        "- outfit_examples는 3개 이상 제공(각각 '타이틀', '아이템 리스트', '포인트', '추천 팔레트 색(위 팔레트에서 참조)' 포함).\n"
     )
 
     user_prompt = {
@@ -392,17 +466,35 @@ def style_report_prompt(style_inputs: Dict[str, Any]) -> Tuple[str, str]:
             "mini_report": {
                 "mood_summary": "",
                 "impression": "",
-                "best_contexts": [],
+                "best_contexts": ["구체적인 상황1", "구체적인 상황2"],
                 "watch_out": "",
                 "maintenance_difficulty": "낮음/중간/높음 중 하나",
             },
             "apply_strategy": "",
             "practice_guide": {
                 "makeup": {"base": "", "points": {"eyes": "", "lips": ""}, "avoid": ""},
-                "fashion": {"silhouette": "", "color_palette": [], "avoid_colors": [], "top5_items": []},
+                "fashion": {
+                    "silhouette": "",
+                    "color_palette": [{"name": "charcoal", "hex": "#2E2E2E"}],
+                    "avoid_colors": [{"name": "neon green", "hex": "#39FF14"}],
+                    "top5_items": [],
+                },
                 "behavior_lifestyle": {"gesture_tone": "", "speech_manner": "", "daily_habits": []},
             },
+            "outfit_examples": [
+                {
+                    "title": "",
+                    "items": ["", "", ""],
+                    "point": "",
+                    "palette_refs": ["charcoal", "ivory"],
+                }
+            ],
         },
+        "rules": [
+            "best_contexts는 최소 4개 이상, 구체적으로",
+            "브랜드/제품명 금지",
+            "색은 반드시 hex로",
+        ],
     }
 
     return system_prompt, json.dumps(user_prompt, ensure_ascii=False)
@@ -456,20 +548,31 @@ with st.sidebar:
 
     st.divider()
 
-    # ✅ 모델 후보 커스터마이즈(원하면 직접 바꿀 수 있게)
     raw_models = st.text_input(
         "OpenAI 모델 후보(쉼표로 구분, 앞부터 우선 시도)",
         value=", ".join(MODEL_CANDIDATES_DEFAULT),
-        help="모델 접근 오류가 나면 여기 후보를 앞에서부터 순서대로 자동 시도합니다.",
     )
-    model_candidates = [m.strip() for m in raw_models.split(",") if m.strip()]
-    if not model_candidates:
-        model_candidates = MODEL_CANDIDATES_DEFAULT
+    model_candidates = [m.strip() for m in raw_models.split(",") if m.strip()] or MODEL_CANDIDATES_DEFAULT
+
+    raw_image_models = st.text_input(
+        "이미지 생성 모델 후보(쉼표로 구분)",
+        value=", ".join(IMAGE_MODEL_CANDIDATES_DEFAULT),
+        help="예시 코디 이미지를 ‘시각화’ 버튼으로 생성합니다. 모델 접근 권한이 없으면 실패할 수 있어요.",
+    )
+    image_model_candidates = [m.strip() for m in raw_image_models.split(",") if m.strip()] or IMAGE_MODEL_CANDIDATES_DEFAULT
+
+    img_size = st.selectbox("코디 이미지 크기", ["1024x1024", "512x512"], index=0)
 
     if st.button("🧹 초기화", use_container_width=True):
-        for k in ["style_messages", "style_report", "style_self_checklist", "pinterest_cache", "pinterest_last_term"]:
-            if k in st.session_state:
-                st.session_state[k] = [] if k == "style_messages" else ({} if k == "pinterest_cache" else "")
+        st.session_state["style_messages"] = []
+        st.session_state["style_report"] = None
+        st.session_state["outfit_images"] = []
+        st.session_state["pinterest_cache"] = {}
+        st.session_state["pinterest_last_term"] = ""
+        st.session_state["pinterest_suggested_queries"] = []
+        st.session_state["pinterest_negative_terms"] = []
+        st.session_state["working_model"] = None
+        st.session_state["working_image_model"] = None
         st.session_state["style_inputs"] = {
             "keywords": [],
             "text_like": "",
@@ -479,23 +582,18 @@ with st.sidebar:
             "uploaded_image_name": None,
             "uploaded_image_analysis": None,
         }
-        st.session_state["pinterest_suggested_queries"] = []
-        st.session_state["pinterest_negative_terms"] = []
-        st.session_state["working_model"] = None
         st.success("초기화 완료!")
 
     st.divider()
     st.markdown(PRIVACY_NOTICE)
 
 # -----------------------------
-# Main: 추구미 챗봇만
+# Main
 # -----------------------------
 st.title("✨ 추구미 챗봇")
-st.caption("키워드(5~10개) + 추가 정보 + (선택) 이미지 분석 + Pinterest 참고까지 한 번에.")
+st.caption("키워드(5~10개) + 추가 정보 + (선택) 이미지 분석 + Pinterest 참고 + 예시 코디 시각화")
 
-# -----------------------------
-# 2-1) 키워드 선택 (5~10)
-# -----------------------------
+# 1) 키워드 선택 (5~10)
 st.subheader("1) 무드/스타일 선택 (5~10개)")
 selected = st.multiselect(
     "끌리는 키워드를 골라주세요",
@@ -506,9 +604,7 @@ selected = st.multiselect(
 st.session_state["style_inputs"]["keywords"] = selected
 st.caption("※ 최소 5개, 최대 10개를 선택해 주세요.")
 
-# -----------------------------
-# 2-2) 제목 변경: "추가 정보를 입력해주세요"
-# -----------------------------
+# 2) 추가 정보 입력
 st.subheader("2) 추가 정보를 입력해주세요")
 col_a, col_b, col_c = st.columns(3)
 with col_a:
@@ -533,9 +629,7 @@ with col_c:
         height=120,
     )
 
-# -----------------------------
-# 2-3) 이미지 업로드(문구에서 '핵심' 제거)
-# -----------------------------
+# 3) 이미지 업로드 — 추구미 분위기 분석
 st.subheader("3) (선택) 이미지 업로드 — 추구미 분위기 분석")
 up = st.file_uploader("좋다고 느꼈던 이미지가 있으면 올려주세요 (jpg/png)", type=["jpg", "jpeg", "png"])
 if up is not None:
@@ -575,13 +669,9 @@ if st.session_state["style_inputs"].get("uploaded_image_analysis"):
         st.session_state["style_inputs"]["keywords"] = merged[:10]
         st.rerun()
 
-# ✅ 요구사항: 2-4 제거(적용 공간 선택 UI 없음)
-
 st.divider()
 
-# -----------------------------
 # Pinterest (선택)
-# -----------------------------
 st.subheader("🧷 Pinterest 참고 이미지(인물 이미지 검색)")
 st.caption("선택한 추구미 키워드로 Pinterest에서 참고 이미지를 가져옵니다(권한/토큰 필요).")
 
@@ -742,6 +832,7 @@ with colr1:
                         timeout=90,
                     )
                     st.session_state["style_report"] = report
+                    st.session_state["outfit_images"] = []  # 리포트 새로 만들면 코디 이미지도 리셋
                     st.success(f"리포트 생성 완료! (사용 모델: {used_model})")
                 except Exception as e:
                     st.error(f"리포트 생성 오류: {e}")
@@ -761,8 +852,16 @@ if st.session_state.get("style_report"):
     mini = r.get("mini_report", {}) or {}
     st.markdown(f"- 분위기 요약: {mini.get('mood_summary','')}")
     st.markdown(f"- 타인 인상: {mini.get('impression','')}")
-    if mini.get("best_contexts"):
-        st.markdown("- 어울리는 상황: " + ", ".join([f"`x`" for x in mini.get("best_contexts", [])]))
+
+    # ✅ 요구사항 반영: 어울리는 상황을 구체적으로 표시 (x가 아니라 실제 값)
+    best = mini.get("best_contexts") or []
+    if best:
+        st.markdown("- 어울리는 상황:")
+        for x in best:
+            st.markdown(f"  - {x}")
+    else:
+        st.caption("어울리는 상황 정보가 없어요(리포트 생성 시 포함되도록 프롬프트를 강화해두었습니다).")
+
     st.markdown(f"- 과도함 주의: {mini.get('watch_out','')}")
     st.markdown(f"- 유지 난이도: **{mini.get('maintenance_difficulty','')}**")
 
@@ -787,10 +886,15 @@ if st.session_state.get("style_report"):
     with cgb:
         st.markdown("#### 👗 패션")
         st.markdown(f"- 실루엣: {f.get('silhouette','')}")
-        if f.get("color_palette"):
-            st.markdown("- 컬러 팔레트: " + ", ".join([f"`{x}`" for x in f.get("color_palette", [])]))
-        if f.get("avoid_colors"):
-            st.markdown("- 피할 컬러: " + ", ".join([f"`{x}`" for x in f.get("avoid_colors", [])]))
+
+        # ✅ 요구사항 반영: 색채 설명 시 "색을 보여주기" (스와치 렌더)
+        palette = f.get("color_palette") or []
+        avoid = f.get("avoid_colors") or []
+        if palette:
+            render_color_swatches(palette, title="추천 컬러 팔레트")
+        if avoid:
+            render_color_swatches(avoid, title="피하면 좋은 컬러")
+
         if f.get("top5_items"):
             st.markdown("- 기본 아이템 Top5:\n" + "\n".join([f"  - {x}" for x in f.get("top5_items", [])]))
 
@@ -800,6 +904,82 @@ if st.session_state.get("style_report"):
     if b.get("daily_habits"):
         st.markdown("- 작은 습관:\n" + "\n".join([f"  - {x}" for x in b.get("daily_habits", [])]))
 
+    # ✅ 요구사항 반영: 예시 코디를 시각적으로 보여주기
+    st.divider()
+    st.subheader("🧥 예시 코디 (텍스트 + 시각화)")
+
+    outfit_examples = r.get("outfit_examples") or []
+    if not outfit_examples:
+        st.caption("예시 코디가 없어요(리포트 생성 프롬프트에서 생성하도록 유도해두었습니다).")
+    else:
+        for i, ex in enumerate(outfit_examples[:6], start=1):
+            title = (ex or {}).get("title", f"코디 {i}")
+            items = (ex or {}).get("items", []) or []
+            point = (ex or {}).get("point", "")
+            refs = (ex or {}).get("palette_refs", []) or []
+
+            with st.expander(f"{i}) {title}", expanded=(i == 1)):
+                if items:
+                    st.markdown("**구성 아이템**")
+                    st.markdown("\n".join([f"- {it}" for it in items]))
+                if point:
+                    st.markdown(f"**포인트**: {point}")
+                if refs:
+                    st.caption("팔레트 참고: " + ", ".join([str(x) for x in refs]))
+
+        st.markdown("#### 🎨 코디 시각화(이미지 생성)")
+        st.caption("선택한 예시 코디를 ‘룩북 스타일’로 간단히 시각화합니다. (브랜드 로고/문구 없이)")
+
+        # 시각화할 코디 선택
+        titles = [(ex or {}).get("title", f"코디 {i+1}") for i, ex in enumerate(outfit_examples[:6])]
+        pick_idx = st.selectbox("시각화할 코디 선택", list(range(len(titles))), format_func=lambda x: titles[x], index=0)
+
+        if st.button("🖼️ 선택 코디를 이미지로 보기", use_container_width=True):
+            if not openai_key:
+                st.warning("OpenAI API Key를 입력해 주세요.")
+            else:
+                ex = outfit_examples[pick_idx]
+                title = (ex or {}).get("title", "outfit")
+                items = (ex or {}).get("items", []) or []
+                point = (ex or {}).get("point", "")
+                refs = (ex or {}).get("palette_refs", []) or []
+
+                # 팔레트에서 hex를 찾아서 프롬프트에 넣기
+                palette_map = {c.get("name"): c.get("hex") for c in (guide.get("fashion", {}) or {}).get("color_palette", []) if isinstance(c, dict)}
+                ref_hex = [f"{n}:{palette_map.get(n)}" for n in refs if palette_map.get(n)]
+
+                img_prompt = (
+                    "Fashion lookbook product photo, clean studio background, "
+                    "full outfit laid out or worn by a faceless mannequin, no logos, no text.\n"
+                    f"Outfit title: {title}\n"
+                    f"Items: {', '.join(items) if items else 'N/A'}\n"
+                    f"Styling point: {point}\n"
+                    f"Color references: {', '.join(ref_hex) if ref_hex else ', '.join(refs)}\n"
+                    "High quality, realistic, editorial style, minimal, soft lighting."
+                )
+
+                with st.spinner("코디 이미지를 생성 중..."):
+                    try:
+                        b64_png, used_img_model = generate_outfit_image_with_fallback(
+                            openai_key,
+                            img_prompt,
+                            image_model_candidates=image_model_candidates,
+                            size=img_size,
+                        )
+                        st.session_state["outfit_images"].append(
+                            {"title": title, "b64": b64_png, "prompt": img_prompt, "model": used_img_model}
+                        )
+                        st.success(f"생성 완료! (이미지 모델: {used_img_model})")
+                    except Exception as e:
+                        st.error(f"이미지 생성 오류: {e}")
+
+        if st.session_state.get("outfit_images"):
+            st.markdown("#### 🖼️ 생성된 코디 이미지")
+            cols = st.columns(3)
+            for i, img in enumerate(st.session_state["outfit_images"][-6:]):
+                with cols[i % 3]:
+                    st.image(base64.b64decode(img["b64"]), caption=img.get("title", "outfit"), use_container_width=True)
+
 st.divider()
 
 # -----------------------------
@@ -808,7 +988,6 @@ st.divider()
 st.subheader("💬 추구미 챗봇에게 물어보기")
 st.caption("선택 키워드/입력 내용을 바탕으로 ‘기준’과 ‘실천 팁’ 위주로 답해요. (브랜드 추천 없음)")
 
-# 대화 렌더
 for m in st.session_state["style_messages"]:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
@@ -823,13 +1002,16 @@ if user_msg:
         with st.chat_message("assistant"):
             st.warning("사이드바에 OpenAI API Key를 입력하면 추구미 챗봇 답변을 받을 수 있어요.")
     else:
-        # 컨텍스트를 system에 합쳐서 “추구미 기준”으로 고정
         ctx = {
             "selected_keywords": st.session_state["style_inputs"].get("keywords", []),
             "text_like": st.session_state["style_inputs"].get("text_like", ""),
             "text_dislike": st.session_state["style_inputs"].get("text_dislike", ""),
             "text_constraints": st.session_state["style_inputs"].get("text_constraints", ""),
             "uploaded_image_analysis": st.session_state["style_inputs"].get("uploaded_image_analysis"),
+            "style_report_summary": {
+                "type_name": (st.session_state.get("style_report") or {}).get("type_name_ko"),
+                "core_keywords": (st.session_state.get("style_report") or {}).get("core_keywords"),
+            },
             "note": "브랜드/제품 추천 금지. 방향성과 기준, 체크리스트만.",
         }
         system_prompt = style_chat_system_prompt() + "\n\n[사용자 컨텍스트]\n" + json.dumps(ctx, ensure_ascii=False)
