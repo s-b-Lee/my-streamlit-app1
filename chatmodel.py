@@ -3,8 +3,7 @@ import base64
 import datetime as dt
 import json
 import re
-import time
-from collections import Counter, defaultdict
+from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 import altair as alt
@@ -40,12 +39,25 @@ MOOD_CHOICES = [
 
 EMOTION_LABELS = ["슬픔", "불안", "분노", "지침", "허무", "설렘", "외로움", "긴장", "무기력", "기대", "안도", "복잡함"]
 
+# ✅ 요구사항 반영: 추구미 선택 키워드 목록을 지정 리스트로 교체
 STYLE_KEYWORDS = [
-    "세련됨", "우아함", "여성스러움", "중성적인", "절제된", "귀여움", "청순함", "강렬한",
-    "섹시한", "무채색의", "시크함", "고급스러움", "러블리", "단아한", "단정한",
+    "세련됨",
+    "우아함",
+    "여성스러움",
+    "중성적인",
+    "절제된",
+    "귀여움",
+    "청순함",
+    "강렬한",
+    "섹시한",
+    "무채색의",
+    "시크함",
+    "고급스러움",
+    "섹시함",
+    "러블리",
+    "단아한",
+    "단정한",
 ]
-
-SPACE_CHOICES = ["학교", "직장", "데이트", "SNS", "공식 자리"]
 
 PERSONAS = {
     "친한 친구": "친근하고 따뜻하되 과장하지 말고, 편하게 말하되 해결로 이어지게.",
@@ -85,6 +97,7 @@ def init_state():
             "text_like": "",
             "text_dislike": "",
             "text_constraints": "",
+            # ✅ 2-4 UI는 제거하지만, 기존 프롬프트/데이터 호환 위해 state 키는 유지(빈 리스트로 사용)
             "spaces": [],
             "uploaded_image_bytes": None,
             "uploaded_image_name": None,
@@ -96,6 +109,9 @@ def init_state():
         "pinterest_cache": {},  # term -> pins list
         "pinterest_last_term": "",
         "active_tab": 0,  # 0 상담, 1 트래커, 2 추구미
+        "pinterest_suggested_queries": [],
+        "pinterest_negative_terms": [],
+        "style_self_checklist": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -108,13 +124,31 @@ init_state()
 # Helpers: Safety / Signals
 # -----------------------------
 CRISIS_PATTERNS = [
-    r"자살", r"죽고\s*싶", r"죽고싶", r"자해", r"해치고\s*싶", r"목숨", r"극단적\s*선택",
-    r"살\s*기\s*싫", r"사라지고\s*싶",
+    r"자살",
+    r"죽고\s*싶",
+    r"죽고싶",
+    r"자해",
+    r"해치고\s*싶",
+    r"목숨",
+    r"극단적\s*선택",
+    r"살\s*기\s*싫",
+    r"사라지고\s*싶",
 ]
 
 STYLE_SIGNAL_PATTERNS = [
-    r"이미지", r"분위기", r"정체성", r"첫인상", r"스타일", r"외모", r"옷", r"메이크업",
-    r"꾸미", r"브랜딩", r"인상", r"자신감.*외모", r"자신감.*스타일",
+    r"이미지",
+    r"분위기",
+    r"정체성",
+    r"첫인상",
+    r"스타일",
+    r"외모",
+    r"옷",
+    r"메이크업",
+    r"꾸미",
+    r"브랜딩",
+    r"인상",
+    r"자신감.*외모",
+    r"자신감.*스타일",
 ]
 
 
@@ -177,7 +211,6 @@ def openai_stream_chat(
                             full_text += delta
                             placeholder.markdown(full_text)
                     except Exception:
-                        # ignore malformed chunks
                         continue
     except requests.exceptions.Timeout:
         raise RuntimeError("요청 시간이 초과됐어요. 네트워크 상태를 확인하고 다시 시도해 주세요.")
@@ -298,14 +331,12 @@ def pinterest_best_image_url(media: Optional[Dict[str, Any]]) -> Optional[str]:
         return None
     images = None
     if isinstance(media, dict):
-        # For SummaryPin: media is PinMedia, 'images' lives under media when media_type == 'image' or 'video'
         images = media.get("images")
     if not isinstance(images, dict):
         return None
     for key in ["600x", "400x300", "1200x", "150x150"]:
         if key in images and isinstance(images[key], dict) and images[key].get("url"):
             return images[key]["url"]
-    # fallback: any dict with url
     for v in images.values():
         if isinstance(v, dict) and v.get("url"):
             return v["url"]
@@ -321,7 +352,7 @@ def pinterest_search_partner_pins(
     bookmark: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    GET /v5/search/partner/pins (beta; might be unavailable) :contentReference[oaicite:0]{index=0}
+    GET /v5/search/partner/pins (beta; might be unavailable)
     """
     url = f"{PINTEREST_BASE}/search/partner/pins"
     params = {
@@ -349,7 +380,7 @@ def pinterest_terms_suggested(
     limit: int = 10,
 ) -> Dict[str, Any]:
     """
-    GET /v5/terms/suggested (ads:read scope in spec; but can be used if permitted) :contentReference[oaicite:1]{index=1}
+    GET /v5/terms/suggested (ads:read scope in spec; but can be used if permitted)
     """
     url = f"{PINTEREST_BASE}/terms/suggested"
     params = {"term": term, "limit": max(1, min(limit, 50))}
@@ -438,7 +469,8 @@ def style_report_prompt(
         "text_like": style_inputs.get("text_like", ""),
         "text_dislike": style_inputs.get("text_dislike", ""),
         "text_constraints": style_inputs.get("text_constraints", ""),
-        "spaces": style_inputs.get("spaces", []),
+        # ✅ 2-4 제거: spaces는 항상 빈 리스트(또는 state에 남아있으면 그대로 전달)
+        "spaces": style_inputs.get("spaces", []) or [],
         "uploaded_image_analysis": style_inputs.get("uploaded_image_analysis"),
         "counselor_summary": counselor_summary,
         "output_schema": {
@@ -528,7 +560,7 @@ with st.sidebar:
     st.markdown(PRIVACY_NOTICE)
 
 # -----------------------------
-# Tabs with controlled navigation
+# Tabs
 # -----------------------------
 tab_titles = ["🧠 AI 상담사", "📊 감정 트래커", "✨ 추구미 설계"]
 tabs = st.tabs(tab_titles)
@@ -540,7 +572,6 @@ with tabs[0]:
     st.title("🧠 AI 상담사")
     st.caption("즉시 공감 + 구체적 행동 제안. 필요하면 자연스럽게 추구미 설계로 연결해요.")
 
-    # render messages
     for m in st.session_state["messages"]:
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
@@ -552,7 +583,6 @@ with tabs[0]:
         with st.chat_message("user"):
             st.markdown(user_input)
 
-        # crisis handling (no model call)
         if detect_crisis(user_input):
             with st.chat_message("assistant"):
                 st.markdown(
@@ -562,10 +592,9 @@ with tabs[0]:
                     "한 가지만 확인할게요: **지금 혼자 있나요, 아니면 누군가 곁에 있나요?**"
                 )
             st.session_state["messages"].append(
-                {"role": "assistant", "content": "지금 안전이 가장 중요해요... (안전 안내 및 확인 질문)"}  # minimal log
+                {"role": "assistant", "content": "지금 안전이 가장 중요해요... (안전 안내 및 확인 질문)"}
             )
         else:
-            # emotion label (json)
             if openai_key:
                 try:
                     sp, up = emotion_label_prompt(user_input)
@@ -576,7 +605,6 @@ with tabs[0]:
                     st.session_state["last_emotion_guess"] = None
                     st.session_state["last_emotion_guess_reason"] = None
 
-            # counselor response
             with st.chat_message("assistant"):
                 if not openai_key:
                     st.warning("사이드바에 OpenAI API Key를 입력하면 상담 응답을 받을 수 있어요.")
@@ -586,7 +614,6 @@ with tabs[0]:
                         assistant_text = openai_stream_chat(openai_key, sys_p, st.session_state["messages"], temperature=0.7)
                         st.session_state["messages"].append({"role": "assistant", "content": assistant_text})
 
-                        # periodically summarize
                         if st.session_state["turn_count"] % 7 == 0:
                             try:
                                 sp2, up2 = summarize_for_style_prompt(st.session_state["messages"])
@@ -605,7 +632,6 @@ with tabs[0]:
                     except Exception as e:
                         st.error(f"오류가 발생했어요: {e}")
 
-            # emotion quick save button
             if st.session_state["last_emotion_guess"]:
                 col_a, col_b = st.columns([1, 2])
                 with col_a:
@@ -626,12 +652,10 @@ with tabs[0]:
                 with col_b:
                     st.caption(f"추정 감정: **{st.session_state['last_emotion_guess']}** · {st.session_state['last_emotion_guess_reason'] or ''}")
 
-            # style-signal detection => propose transition
             if detect_style_signal(user_input):
                 st.session_state["move_to_style"] = True
 
             if st.session_state["move_to_style"] and openai_key:
-                # build counselor summary for tab3
                 if not st.session_state["counsel_summary_for_style"]:
                     try:
                         sp3, up3 = summarize_for_style_prompt(st.session_state["messages"])
@@ -702,10 +726,12 @@ with tabs[1]:
             st.dataframe(df_show, use_container_width=True, hide_index=True)
 
             st.subheader("📈 요일별 기분 분포(간단)")
-            mood_rank = {name: i for i, name in enumerate(["슬픔", "불안", "분노", "지침", "허무", "보통", "괜찮음", "좋음", "설렘"], start=1)}
-            # use mood_name as proxy score
             df_score = df.copy()
-            df_score["score"] = df_score["mood_name"].map({"슬픔": 2, "불안": 3, "분노": 3, "지침": 3, "보통": 5, "괜찮음": 6, "좋음": 7, "설렘": 8}).fillna(5)
+            df_score["score"] = (
+                df_score["mood_name"]
+                .map({"슬픔": 2, "불안": 3, "분노": 3, "지침": 3, "보통": 5, "괜찮음": 6, "좋음": 7, "설렘": 8})
+                .fillna(5)
+            )
             order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
             df_score["weekday"] = pd.Categorical(df_score["weekday"], categories=order, ordered=True)
 
@@ -738,7 +764,6 @@ with tabs[2]:
     st.title("✨ 추구미 도우미 - 당신을 브랜딩하는 첫걸음, 추구미")
     st.caption("선택 키워드 + 텍스트 + (선택) 이미지로 추구미 리포트를 만들고, Pinterest 이미지 참고도 붙여요.")
 
-    # Auto-inject counseling summary if moved
     if st.session_state.get("counsel_summary_for_style"):
         st.info("✅ 상담 탭의 요약이 자동 전달됐어요.")
         st.text_area(
@@ -748,6 +773,7 @@ with tabs[2]:
             disabled=True,
         )
 
+    # ✅ 요구사항: 2-1) 키워드 5~10개 선택 (리스트는 위 STYLE_KEYWORDS로 고정)
     st.subheader("1) 무드/스타일 선택 (5~10개)")
     selected = st.multiselect(
         "끌리는 키워드를 골라주세요",
@@ -757,7 +783,8 @@ with tabs[2]:
     )
     st.session_state["style_inputs"]["keywords"] = selected
 
-    st.subheader("2) 텍스트 보조 입력")
+    # ✅ 요구사항: 2-2) 제목 문구 변경
+    st.subheader("2) 추가 정보를 입력해주세요")
     col_a, col_b, col_c = st.columns(3)
     with col_a:
         st.session_state["style_inputs"]["text_like"] = st.text_area(
@@ -781,7 +808,8 @@ with tabs[2]:
             height=120,
         )
 
-    st.subheader("3) (선택) 사진 업로드 — 추구미 분위기 분석")
+    # ✅ 요구사항: 2-3) '이미지 업로드(핵심)' 문구 제거 (섹션은 유지하되 문구에 '핵심' 없음)
+    st.subheader("3) (선택) 이미지 업로드 — 추구미 분위기 분석")
     up = st.file_uploader("좋다고 느꼈던 이미지가 있으면 올려주세요 (jpg/png)", type=["jpg", "jpeg", "png"])
     if up is not None:
         img_bytes = up.read()
@@ -815,13 +843,9 @@ with tabs[2]:
             st.session_state["style_inputs"]["keywords"] = merged[:10]
             st.rerun()
 
-    st.subheader("4) 적용 공간 선택")
-    spaces = st.multiselect(
-        "어떤 공간/상황에서 이 추구미를 주로 쓰고 싶나요?",
-        SPACE_CHOICES,
-        default=st.session_state["style_inputs"].get("spaces", []),
-    )
-    st.session_state["style_inputs"]["spaces"] = spaces
+    # ✅ 요구사항: 2-4) 적용 공간 선택 섹션 제거
+    # (spaces state는 유지하지만, UI/입력은 제거)
+    st.session_state["style_inputs"]["spaces"] = []
 
     st.divider()
 
@@ -842,12 +866,13 @@ with tabs[2]:
 
         suggested_queries = []
         negative_terms = []
+
         if auto_expand and openai_key and st.session_state["style_inputs"]["keywords"]:
             if st.button("🔎 검색어 추천 만들기", use_container_width=True):
                 try:
                     spx, upx = pinterest_query_expander_prompt(
                         st.session_state["style_inputs"]["keywords"],
-                        st.session_state["style_inputs"]["spaces"],
+                        [],  # ✅ 2-4 제거: spaces는 빈 리스트
                         locale_hint="Korean + English mix",
                     )
                     qq = openai_json(openai_key, spx, upx, temperature=0.2)
@@ -902,7 +927,6 @@ with tabs[2]:
                                 limit=12,
                             )
                             items = data.get("items", []) or []
-                            # normalize minimal fields
                             norm = []
                             for it in items:
                                 media = it.get("media") or {}
@@ -940,7 +964,6 @@ with tabs[2]:
             for i, p in enumerate(pins):
                 with cols[i % 3]:
                     if p.get("img"):
-                        # clickable image via HTML
                         link = p.get("link") or "https://www.pinterest.com/"
                         title = (p.get("title") or "").strip() or "Pinterest Pin"
                         st.markdown(
@@ -966,7 +989,7 @@ with tabs[2]:
 
     # Generate style report
     st.subheader("🧾 추구미 분석 & 리포트")
-    can_run = len(st.session_state["style_inputs"]["keywords"]) >= 5 and len(st.session_state["style_inputs"]["keywords"]) <= 10
+    can_run = 5 <= len(st.session_state["style_inputs"]["keywords"]) <= 10
 
     colr1, colr2 = st.columns([1, 2])
     with colr1:
@@ -1068,7 +1091,6 @@ with tabs[2]:
                                 f"- 패션: {json.dumps(f, ensure_ascii=False)}\n\n"
                                 "요청: 사진을 보지 않는 조건에서, 사용자가 스스로 점검할 체크리스트를 만들어줘."
                             )
-                            # stream as normal (single placeholder)
                             with st.chat_message("assistant"):
                                 txt = openai_stream_chat(
                                     openai_key,
@@ -1088,7 +1110,4 @@ with tabs[2]:
 # Controlled tab jump (rerun-based)
 # -----------------------------
 if st.session_state.get("active_tab", 0) != 0:
-    # We can't directly programmatically switch st.tabs reliably,
-    # so we use rerun hint + user experience (most Streamlit versions).
-    # If user clicked "추구미 설계 시작", we already reran.
     pass
