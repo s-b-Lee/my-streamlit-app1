@@ -10,7 +10,7 @@ import streamlit as st
 # Page
 # -----------------------------
 st.set_page_config(
-    page_title="추구미 챗봇 (이미지 정체성 설계)",
+    page_title="🫧이미지 레시피 - 직접 설계하는 내 이미지",
     page_icon="✨",
     layout="wide",
 )
@@ -294,8 +294,6 @@ def openai_vision_analyze_style_with_fallback(
 # OpenAI Images API (optional) with fallback
 # -----------------------------
 def _post_images(api_key: str, payload: Dict[str, Any], timeout: int = 120) -> requests.Response:
-    # ✅ 오류 수정: 404 원인 = 잘못된 엔드포인트
-    #   올바른 이미지 생성 엔드포인트로 변경
     url = "https://api.openai.com/v1/images/generations"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     return requests.post(url, headers=headers, json=payload, timeout=timeout)
@@ -326,7 +324,6 @@ def generate_outfit_image_with_fallback(
             "model": model,
             "prompt": prompt,
             "size": size,
-            # b64_json 응답을 기대 (기본)
         }
         try:
             r = _post_images(api_key, payload, timeout=180)
@@ -592,8 +589,7 @@ with st.sidebar:
 # -----------------------------
 # Main
 # -----------------------------
-st.title("✨ 추구미 챗봇")
-st.caption("키워드(5~10개) + 추가 정보 + (선택) 이미지 분석 + Pinterest 참고 + 예시 코디 시각화")
+st.title("🫧이미지 레시피 - 직접 설계하는 내 이미지")
 
 # 1) 키워드 선택 (5~10)
 st.subheader("1) 무드/스타일 선택 (5~10개)")
