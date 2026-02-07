@@ -1,532 +1,1094 @@
 # app.py
 import base64
+import datetime as dt
 import json
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+import re
+import time
+from collections import Counter, defaultdict
+from typing import Any, Dict, List, Optional, Tuple
 
+import altair as alt
 import pandas as pd
+import requests
 import streamlit as st
-from openai import OpenAI
 
-# =========================
-# Page Config
-# =========================
+# -----------------------------
+# Page
+# -----------------------------
 st.set_page_config(
-    page_title="🎨 추구미(이미지 정체성) 설계 AI",
-    page_icon="🎨",
+    page_title="통합 AI 앱 (상담사 + 감정 트래커 + 추구미 설계)",
+    page_icon="🧠✨",
     layout="wide",
 )
 
-# =========================
-# Session State
-# =========================
+# -----------------------------
+# Constants / Config
+# -----------------------------
+OPENAI_MODEL = "gpt-4-mini"
+PINTEREST_BASE = "https://api.pinterest.com/v5"
+
+MOOD_CHOICES = [
+    ("😄", "좋음"),
+    ("🙂", "괜찮음"),
+    ("😐", "보통"),
+    ("😟", "불안"),
+    ("😢", "슬픔"),
+    ("😠", "분노"),
+    ("🥱", "지침"),
+    ("✨", "설렘"),
+]
+
+EMOTION_LABELS = ["슬픔", "불안", "분노", "지침", "허무", "설렘", "외로움", "긴장", "무기력", "기대", "안도", "복잡함"]
+
+STYLE_KEYWORDS = [
+    "세련됨", "우아함", "여성스러움", "중성적인", "절제된", "귀여움", "청순함", "강렬한",
+    "섹시한", "무채색의", "시크함", "고급스러움", "러블리", "단아한", "단정한",
+]
+
+SPACE_CHOICES = ["학교", "직장", "데이트", "SNS", "공식 자리"]
+
+PERSONAS = {
+    "친한 친구": "친근하고 따뜻하되 과장하지 말고, 편하게 말하되 해결로 이어지게.",
+    "차분한 전문가": "차분하고 안정적이며 구조적으로 정리해서 말하기.",
+    "코치 스타일": "목표-현실-옵션-실행으로 이끄는 코칭 톤, 단 실행 가능하게.",
+}
+
+CATEGORIES = ["자기계발", "커리어", "연애", "인간관계", "기타"]
+
+PRIVACY_NOTICE = (
+    "⚠️ **고지**: 이 앱은 의료/심리 **진단**을 제공하지 않습니다. "
+    "자해/자살 등 위기 상황이 있거나 안전이 우려되면, 즉시 112/119 또는 "
+    "가까운 응급실/전문기관의 도움을 받으세요."
+)
+
+# Pinterest Search Notes (important to set expectations)
+PINTEREST_NOTE = (
+    "ℹ️ Pinterest API는 **OAuth Access Token(베어러 토큰)** 기반입니다. "
+    "또한 `GET /v5/search/partner/pins`는 **베타이며 모든 앱에서 사용 불가**일 수 있어요. "
+    "사용 불가(403 등)면 앱에서 안내 문구가 표시됩니다."
+)
+
+# -----------------------------
+# Session State Init
+# -----------------------------
 def init_state():
-    st.session_state.setdefault("openai_api_key", "")
-    st.session_state.setdefault("model", "gpt-4-mini")
+    defaults = {
+        "messages": [],  # 상담 대화
+        "turn_count": 0,
+        "mood_logs": [],  # 감정 기록
+        "persona": "차분한 전문가",
+        "category": "자기계발",
+        "move_to_style": False,
+        "counsel_summary_for_style": "",
+        "style_inputs": {
+            "keywords": [],
+            "text_like": "",
+            "text_dislike": "",
+            "text_constraints": "",
+            "spaces": [],
+            "uploaded_image_bytes": None,
+            "uploaded_image_name": None,
+            "uploaded_image_analysis": None,
+        },
+        "style_report": None,
+        "last_emotion_guess": None,
+        "last_emotion_guess_reason": None,
+        "pinterest_cache": {},  # term -> pins list
+        "pinterest_last_term": "",
+        "active_tab": 0,  # 0 상담, 1 트래커, 2 추구미
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-    # Inputs
-    st.session_state.setdefault("selected_cards", [])
-    st.session_state.setdefault("dislikes", "")
-    st.session_state.setdefault("wants", "")
-    st.session_state.setdefault("constraints", "")
-    st.session_state.setdefault("places", [])
-    st.session_state.setdefault("notes", "")
-
-    # Outputs
-    st.session_state.setdefault("style_report", "")
-    st.session_state.setdefault("inspo_analysis", "")
-    st.session_state.setdefault("fit_feedback", "")
-
-    # Tracker
-    st.session_state.setdefault("style_logs", [])  # list[dict]
-
-    # Memory
-    st.session_state.setdefault("last_profile_summary", "")  # short summary for follow-up
-    st.session_state.setdefault("followup_question", "")
 
 init_state()
 
-# =========================
-# Helpers
-# =========================
-def get_client() -> OpenAI:
-    return OpenAI(api_key=st.session_state.openai_api_key)
+# -----------------------------
+# Helpers: Safety / Signals
+# -----------------------------
+CRISIS_PATTERNS = [
+    r"자살", r"죽고\s*싶", r"죽고싶", r"자해", r"해치고\s*싶", r"목숨", r"극단적\s*선택",
+    r"살\s*기\s*싫", r"사라지고\s*싶",
+]
 
-def b64_data_url(file_bytes: bytes, mime: str) -> str:
-    b64 = base64.b64encode(file_bytes).decode("utf-8")
-    # Responses API 이미지 입력은 image_url에 data URL 형태 지원 (docs 예시: data:image/jpeg;base64,...)
-    return f"data:{mime};base64,{b64}"
+STYLE_SIGNAL_PATTERNS = [
+    r"이미지", r"분위기", r"정체성", r"첫인상", r"스타일", r"외모", r"옷", r"메이크업",
+    r"꾸미", r"브랜딩", r"인상", r"자신감.*외모", r"자신감.*스타일",
+]
 
-def safe_trim_images(files: List, max_images: int = 3) -> List:
-    if not files:
-        return []
-    return files[:max_images]
 
-def stream_response_text(
-    client: OpenAI,
-    system_instructions: str,
-    input_items: List[Dict],
+def detect_crisis(text: str) -> bool:
+    t = text.strip().lower()
+    return any(re.search(p, t) for p in CRISIS_PATTERNS)
+
+
+def detect_style_signal(text: str) -> bool:
+    t = text.strip().lower()
+    return any(re.search(p, t) for p in STYLE_SIGNAL_PATTERNS)
+
+
+# -----------------------------
+# OpenAI (Streaming) via REST
+# -----------------------------
+def openai_stream_chat(
+    api_key: str,
+    system_prompt: str,
+    messages: List[Dict[str, str]],
+    temperature: float = 0.6,
 ) -> str:
     """
-    Stream text with ONE placeholder (stable rendering).
-    Uses Responses API streaming events: response.output_text.delta
+    Stream response safely using a single placeholder (st.empty).
+    Uses OpenAI Chat Completions-compatible REST path.
     """
-    ph = st.empty()
-    acc = ""
-
-    stream = client.responses.create(
-        model=st.session_state.model,
-        instructions=system_instructions,
-        input=input_items,
-        stream=True,
-    )
-
-    for event in stream:
-        etype = getattr(event, "type", None)
-        if etype is None and isinstance(event, dict):
-            etype = event.get("type")
-
-        if etype == "response.output_text.delta":
-            delta = getattr(event, "delta", None)
-            if delta is None and isinstance(event, dict):
-                delta = event.get("delta", "")
-            if delta:
-                acc += delta
-                ph.markdown(acc)
-
-        if etype in ("response.completed", "response.done"):
-            break
-
-    ph.markdown(acc)
-    return acc
-
-def now_kst_str() -> str:
-    # Streamlit Cloud/로컬 타임존이 다를 수 있어도 일단 ISO로 기록
-    return datetime.now().isoformat(timespec="seconds")
-
-# =========================
-# System Prompts
-# =========================
-STYLE_SYSTEM = """
-당신은 '추구미(이미지 정체성) 설계' 전문 AI입니다.
-
-서비스 정의:
-- 사용자가 어떤 사람처럼 보이고 싶은지(이미지/분위기/정체성)를 구조화된 언어로 정의하고,
-  화장/패션/태도/라이프스타일까지 연결해 실천하도록 돕는다.
-- 단순 미용/패션 추천이 아니라 '정체성 설계 도구'다.
-
-절대 규칙:
-- 브랜드/제품 추천 금지(방향성 중심).
-- 단정/비하/외모 평가 금지. "추구미 기준 적합성"으로만 말한다.
-- 의료/심리 진단 금지.
-- 결과는 두괄식, 불필요한 말 없이.
-
-출력 형식(반드시 유지):
-1) 핵심 키워드 3~5개
-2) 추구미 타입명 (국문 + 영문)
-3) 한 문장 정체성 정의
-4) 미니 리포트
-   - 전체 분위기 요약
-   - 타인에게 주는 인상
-   - 잘 어울리는 상황(학교/직장/데이트/SNS/공식 자리 등과 연결)
-   - 과도함 주의 포인트
-   - 유지 난이도(낮/중/높) + 이유 1줄
-5) 실천 가이드(방향성만)
-   - 메이크업: 베이스 / 눈 / 입 / 피하면 좋은 요소
-   - 패션: 실루엣 / 컬러 팔레트 / 피하면 좋은 컬러 / 기본 아이템 Top5
-6) 다음 실험(1주 플랜)
-   - 이번 주에 바로 해볼 수 있는 작은 실험 3개
-""".strip()
-
-INSPO_IMAGE_SYSTEM = """
-당신은 '추구미 레퍼런스(인스포) 이미지 분석가'다.
-사용자가 업로드한 '좋다고 느꼈던 이미지'들을 보고(이미지 자체를 분석),
-공통된 무드/스타일 신호를 추출해 '추구미 설계'에 쓸 수 있는 구조화된 요약을 만든다.
-
-규칙:
-- 사람 얼굴/체형/외모 평가 금지.
-- 브랜드/제품 추정 금지.
-- 이미지 속에서 관찰되는 요소(실루엣, 소재 느낌, 색감, 대비, 광택, 디테일, 무드, TPO)를 중심으로 말한다.
-- 추측이 필요하면 "추정"으로 표시.
-
-출력 형식(반드시 유지):
-A) 공통 무드 키워드 5개
-B) 스타일 신호 6개(예: 직선/곡선, 미니멀/디테일, 대비, 소재 질감, 컬러 톤, 액세서리 밀도 등)
-C) 추천 컬러 톤 4개(예: 뉴트럴/저채도/고채도 포인트 등) + 피할 톤 2개
-D) 추구미 문장 1개(한 줄)
-E) 다음 단계 질문 3개(사용자에게 확인할 질문)
-""".strip()
-
-FIT_FEEDBACK_SYSTEM = """
-당신은 '추구미 적합성 피드백' 전문 AI다.
-사용자가 업로드한 본인 스타일 사진(또는 현재 스타일을 보여주는 이미지)을 보고,
-이미 정의된 추구미(키워드/타입/문장)를 기준으로 "적합성"을 피드백한다.
-
-규칙:
-- 외모 비하/판단 금지. 아름다움 평가 금지.
-- 체형/민감 특성 추정 금지.
-- 브랜드/제품 추천 금지(방향성 제시만).
-- 수치(%)는 정밀 측정이 아니라 "체감 적합성"으로 제시하고, 근거는 관찰 기반으로 짧게.
-
-출력 형식(반드시 유지):
-1) 추구미 일치도: XX%
-2) 잘된 점 3개 (추구미 기준)
-3) 어긋난 신호 3개 (추구미 기준)
-4) 개선 제안 3개 (방향성)
-5) 대체 방향 2개 (선택지)
-""".strip()
-
-# =========================
-# UI: Sidebar
-# =========================
-with st.sidebar:
-    st.header("⚙️ 설정")
-
-    st.session_state.openai_api_key = st.text_input(
-        "OpenAI API Key",
-        type="password",
-        value=st.session_state.openai_api_key,
-        placeholder="sk-...",
-    )
-
-    st.session_state.model = st.selectbox(
-        "모델",
-        options=["gpt-4-mini"],
-        index=0,
-        help="요구사항에 맞춰 gpt-4-mini 사용",
-    )
-
-    st.divider()
-    st.caption("🔒 키는 세션에만 유지됩니다(저장되지 않음).")
-
-    if st.button("🧹 전체 초기화"):
-        for k in [
-            "selected_cards", "dislikes", "wants", "constraints", "places", "notes",
-            "style_report", "inspo_analysis", "fit_feedback",
-            "style_logs", "last_profile_summary", "followup_question",
-        ]:
-            if k in st.session_state:
-                del st.session_state[k]
-        init_state()
-        st.rerun()
-
-# =========================
-# Main Header
-# =========================
-st.title("🎨 추구미(이미지 정체성) 설계 AI")
-st.caption("‘예뻐지는 법’이 아니라, **내가 어떤 사람처럼 보이고 싶은지**를 구조화하고 실행으로 연결합니다.")
-
-if not st.session_state.openai_api_key.strip():
-    st.warning("사이드바에 OpenAI API Key를 입력하면 기능이 활성화됩니다.")
-    st.stop()
-
-tabs = st.tabs(["① 추구미 발견", "② 추구미 리포트", "③ 사진 기반 피드백", "④ 추구미 트래커"])
-
-# =========================
-# TAB 1: Discovery (incl. 2-3 image upload)
-# =========================
-with tabs[0]:
-    st.subheader("① 추구미 발견")
-
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        st.markdown("#### 2-1) 무드/스타일 선택(카드 대체 UI)")
-        mood_cards = ["청순", "시크", "힙", "차분", "관능", "내추럴"]
-        style_cards = ["미니멀", "스트릿", "클래식", "Y2K", "캐주얼"]
-        st.session_state.selected_cards = st.multiselect(
-            "끌리는 키워드(5~10개 추천)",
-            options=mood_cards + style_cards,
-            default=st.session_state.selected_cards,
-        )
-
-    with c2:
-        st.markdown("#### 2-2) 텍스트 보조 입력")
-        st.session_state.dislikes = st.text_area(
-            "이런 느낌은 싫어요",
-            value=st.session_state.dislikes,
-            placeholder="예: 너무 꾸민 느낌 말고, 과한 펄/고채도, 과한 로고, 답답한 인상",
-            height=80,
-        )
-        st.session_state.wants = st.text_area(
-            "원하는 느낌/한 문장",
-            value=st.session_state.wants,
-            placeholder="예: 편해 보이는데 세련됐으면, 신뢰감+차분함, 가까이 가기 쉬운 단정함",
-            height=80,
-        )
-        st.session_state.constraints = st.text_area(
-            "제약/조건(선택)",
-            value=st.session_state.constraints,
-            placeholder="예: 학교/실습 환경, 예산, 피부 표현 선호(매트/세미글로우), 활동량",
-            height=70,
-        )
-
-    st.markdown("#### 2-4) 상황 기반 질문(공간 선택)")
-    st.session_state.places = st.multiselect(
-        "이 추구미로 주로 가고 싶은 공간",
-        options=["학교", "직장", "데이트", "SNS", "공식 자리"],
-        default=st.session_state.places,
-    )
-
-    st.divider()
-
-    st.markdown("#### 2-3) 이미지 업로드(핵심) — 내가 ‘좋다’고 느낀 레퍼런스")
-    st.caption("여기 업로드한 이미지의 **무드/스타일 신호를 실제로 분석**해서 추구미 설계에 반영합니다. (최대 3장 권장)")
-    inspo_files = st.file_uploader(
-        "레퍼런스 이미지 업로드(선택)",
-        type=["png", "jpg", "jpeg", "webp"],
-        accept_multiple_files=True,
-        key="inspo_files",
-    )
-
-    analyze_inspo = st.button("🔍 레퍼런스 이미지에서 추구미 신호 뽑기", use_container_width=True)
-
-    if analyze_inspo:
-        files = safe_trim_images(inspo_files or [], max_images=3)
-        if not files:
-            st.warning("레퍼런스 이미지를 1장 이상 업로드해 주세요.")
-            st.stop()
-
-        client = get_client()
-
-        content_parts = [{"type": "input_text", "text": "업로드된 레퍼런스 이미지들을 분석해 추구미 신호를 구조화해줘."}]
-        for f in files:
-            mime = f.type or "image/jpeg"
-            data_url = b64_data_url(f.getvalue(), mime)
-            content_parts.append({"type": "input_image", "image_url": data_url})
-
-        input_items = [{"role": "user", "content": content_parts}]
-
-        with st.spinner("이미지 분석 중..."):
-            try:
-                text = stream_response_text(client, INSPO_IMAGE_SYSTEM, input_items)
-            except Exception as e:
-                st.error(f"OpenAI API 오류: {e}")
-                st.stop()
-
-        st.session_state.inspo_analysis = text
-        st.rerun()
-
-    if st.session_state.inspo_analysis:
-        st.markdown("### ✅ 레퍼런스 이미지 기반 요약")
-        st.markdown(st.session_state.inspo_analysis)
-
-    st.divider()
-    st.session_state.notes = st.text_input(
-        "추가로 알려주고 싶은 것(선택)",
-        value=st.session_state.notes,
-        placeholder="예: 너무 차가워 보이진 않았으면, 하지만 프로페셔널함은 유지하고 싶어요",
-    )
-
-# =========================
-# TAB 2: Report
-# =========================
-with tabs[1]:
-    st.subheader("② AI 추구미 분석 & 리포트")
-
-    st.caption("선택 카드 + 텍스트 + (있다면) 레퍼런스 이미지 분석 결과를 합쳐 최종 추구미 리포트를 생성합니다.")
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     payload = {
-        "selected_cards": st.session_state.selected_cards,
-        "dislikes": st.session_state.dislikes,
-        "wants": st.session_state.wants,
-        "constraints": st.session_state.constraints,
-        "places": st.session_state.places,
-        "inspo_image_analysis": st.session_state.inspo_analysis,
-        "notes": st.session_state.notes,
+        "model": OPENAI_MODEL,
+        "temperature": temperature,
+        "stream": True,
+        "messages": [{"role": "system", "content": system_prompt}] + messages,
     }
 
-    colA, colB = st.columns([1, 1])
-    with colA:
-        st.markdown("#### 입력 요약")
-        st.json(payload, expanded=False)
-    with colB:
-        st.markdown("#### 생성 버튼")
-        build_report = st.button("✨ 추구미 리포트 생성", use_container_width=True)
+    placeholder = st.empty()
+    full_text = ""
 
-    if build_report:
-        if len(st.session_state.selected_cards) < 5 and not st.session_state.inspo_analysis.strip():
-            st.warning("키워드를 5개 이상 선택하거나, 레퍼런스 이미지 분석을 먼저 진행해 주세요.")
-            st.stop()
+    try:
+        with requests.post(url, headers=headers, json=payload, stream=True, timeout=120) as r:
+            if r.status_code != 200:
+                try:
+                    err = r.json()
+                except Exception:
+                    err = {"error": {"message": r.text}}
+                raise RuntimeError(err.get("error", {}).get("message", f"HTTP {r.status_code}"))
 
-        client = get_client()
-        input_items = [{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": "아래 입력을 바탕으로 추구미 리포트를 작성해줘."},
-                {"type": "input_text", "text": f"입력(JSON): {json.dumps(payload, ensure_ascii=False)}"},
-            ],
-        }]
+            for line in r.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                if line.startswith("data: "):
+                    data = line[len("data: ") :].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        j = json.loads(data)
+                        delta = j["choices"][0]["delta"].get("content", "")
+                        if delta:
+                            full_text += delta
+                            placeholder.markdown(full_text)
+                    except Exception:
+                        # ignore malformed chunks
+                        continue
+    except requests.exceptions.Timeout:
+        raise RuntimeError("요청 시간이 초과됐어요. 네트워크 상태를 확인하고 다시 시도해 주세요.")
+    except requests.exceptions.RequestException:
+        raise RuntimeError("네트워크 오류가 발생했어요. 잠시 후 다시 시도해 주세요.")
 
-        with st.spinner("리포트 생성 중..."):
-            try:
-                report = stream_response_text(client, STYLE_SYSTEM, input_items)
-            except Exception as e:
-                st.error(f"OpenAI API 오류: {e}")
-                st.stop()
+    return full_text
 
-        st.session_state.style_report = report
 
-        # 짧은 프로필 요약(후속 질문/트래커에 활용)
-        st.session_state.last_profile_summary = (
-            f"키워드: {', '.join(st.session_state.selected_cards[:8])}\n"
-            f"원하는 느낌: {st.session_state.wants.strip() or '(미입력)'}\n"
-            f"피하고 싶은 것: {st.session_state.dislikes.strip() or '(미입력)'}"
-        )
-        st.session_state.followup_question = "요즘 환경(학교/직장/대인관계)이 바뀌었나요? 바뀐 점 1~2가지만 적어줘요."
-        st.rerun()
+def openai_json(
+    api_key: str,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 0.2,
+) -> Dict[str, Any]:
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": temperature,
+        "stream": False,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    if r.status_code != 200:
+        try:
+            err = r.json()
+        except Exception:
+            err = {"error": {"message": r.text}}
+        raise RuntimeError(err.get("error", {}).get("message", f"HTTP {r.status_code}"))
+    content = r.json()["choices"][0]["message"]["content"]
+    return json.loads(content)
 
-    if st.session_state.style_report:
-        st.markdown("### 📄 나의 추구미 리포트")
-        st.markdown(st.session_state.style_report)
+
+def openai_vision_analyze_style(
+    api_key: str,
+    image_bytes: bytes,
+    allowed_keywords: List[str],
+) -> Dict[str, Any]:
+    """
+    Analyze uploaded image for '추구미' cues using a vision-capable chat request.
+    Returns JSON: {keywords:[], rationale:"", warnings:""}
+    """
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    data_url = f"data:image/jpeg;base64,{b64}"
+
+    system_prompt = (
+        "당신은 '추구미(이미지 정체성)' 분석가입니다. "
+        "사용자가 업로드한 이미지를 보고, 주어진 키워드 후보 중에서만 "
+        "이미지의 분위기/스타일에 해당하는 키워드를 골라주세요. "
+        "과장하지 말고, 보이는 근거를 짧게 설명하세요. "
+        "개인 식별(누구인지, 나이 추정 등)은 하지 마세요. "
+        "반드시 JSON으로만 답하세요."
+    )
+
+    user_prompt = {
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": (
+                    f"허용 키워드 후보:\n{allowed_keywords}\n\n"
+                    "요청:\n"
+                    "1) 후보 중 3~7개 키워드를 선택\n"
+                    "2) 근거를 한 단락으로 짧게\n"
+                    "3) 이미지가 추구미 분석에 부적절/애매하면 경고문(warnings)에 한 줄\n\n"
+                    "출력 JSON 스키마:\n"
+                    '{ "keywords": [...], "rationale": "...", "warnings": "..." }'
+                ),
+            },
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ],
+    }
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0.2,
+        "stream": False,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            user_prompt,
+        ],
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=90)
+    if r.status_code != 200:
+        try:
+            err = r.json()
+        except Exception:
+            err = {"error": {"message": r.text}}
+        raise RuntimeError(err.get("error", {}).get("message", f"HTTP {r.status_code}"))
+    content = r.json()["choices"][0]["message"]["content"]
+    return json.loads(content)
+
+
+# -----------------------------
+# Pinterest API helpers
+# -----------------------------
+def pinterest_headers(access_token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+def pinterest_best_image_url(media: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    PinMediaWithImage.images includes keys like '1200x', '600x', '400x300', '150x150'
+    """
+    if not media:
+        return None
+    images = None
+    if isinstance(media, dict):
+        # For SummaryPin: media is PinMedia, 'images' lives under media when media_type == 'image' or 'video'
+        images = media.get("images")
+    if not isinstance(images, dict):
+        return None
+    for key in ["600x", "400x300", "1200x", "150x150"]:
+        if key in images and isinstance(images[key], dict) and images[key].get("url"):
+            return images[key]["url"]
+    # fallback: any dict with url
+    for v in images.values():
+        if isinstance(v, dict) and v.get("url"):
+            return v["url"]
+    return None
+
+
+def pinterest_search_partner_pins(
+    access_token: str,
+    term: str,
+    country_code: str = "KR",
+    locale: str = "ko-KR",
+    limit: int = 12,
+    bookmark: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    GET /v5/search/partner/pins (beta; might be unavailable) :contentReference[oaicite:0]{index=0}
+    """
+    url = f"{PINTEREST_BASE}/search/partner/pins"
+    params = {
+        "term": term,
+        "country_code": country_code,
+        "locale": locale,
+        "limit": max(1, min(limit, 50)),
+    }
+    if bookmark:
+        params["bookmark"] = bookmark
+
+    r = requests.get(url, headers=pinterest_headers(access_token), params=params, timeout=30)
+    if r.status_code != 200:
+        try:
+            err = r.json()
+        except Exception:
+            err = {"message": r.text}
+        raise RuntimeError(f"Pinterest API 오류 ({r.status_code}): {err}")
+    return r.json()
+
+
+def pinterest_terms_suggested(
+    access_token: str,
+    term: str,
+    limit: int = 10,
+) -> Dict[str, Any]:
+    """
+    GET /v5/terms/suggested (ads:read scope in spec; but can be used if permitted) :contentReference[oaicite:1]{index=1}
+    """
+    url = f"{PINTEREST_BASE}/terms/suggested"
+    params = {"term": term, "limit": max(1, min(limit, 50))}
+    r = requests.get(url, headers=pinterest_headers(access_token), params=params, timeout=30)
+    if r.status_code != 200:
+        try:
+            err = r.json()
+        except Exception:
+            err = {"message": r.text}
+        raise RuntimeError(f"Pinterest terms 오류 ({r.status_code}): {err}")
+    return r.json()
+
+
+# -----------------------------
+# Prompt builders
+# -----------------------------
+def counselor_system_prompt(category: str, persona: str) -> str:
+    return f"""
+당신은 대학생/대학원생 대상의 AI 상담사 겸 코치입니다.
+
+말투/성격:
+- 두괄식, 필요한 말만, 논리적
+- 이해를 돕는 비유는 최대 1회만
+- "즉시 공감 + 구체적 행동 제안" 패턴을 기본으로
+- 단정하지 말고, 일반적으로 알려진 수준으로 말하되 과장 금지
+
+카테고리: {category}
+대화 톤(캐릭터): {persona} ({PERSONAS.get(persona, "")})
+
+안전:
+- 자해/자살/위험 신호가 감지되면: 즉시 안전 안내 + 전문기관 권유를 하고,
+  안전 확인 질문은 1개만 한다.
+
+주기 요약:
+- 6~8턴마다 "요약 + 다음 행동 2~3개"를 짧게 제공한다.
+
+출력 형식:
+- 항상 한국어
+- 1) 공감 한 문장
+- 2) 상황 정리(핵심 1~2문장)
+- 3) 다음 행동 제안 2~3개(불릿)
+- 필요할 때만 질문 1개
+""".strip()
+
+
+def emotion_label_prompt(user_text: str) -> Tuple[str, str]:
+    system_prompt = (
+        "당신은 감정 라벨러입니다. 사용자의 문장을 읽고 가장 강한 감정 1개와 보조 감정 1개를 고르세요. "
+        "추측임을 명확히 하고, 근거는 짧게. 반드시 JSON으로만 답하세요."
+    )
+    user_prompt = (
+        f"문장:\n{user_text}\n\n"
+        f"가능 라벨:\n{EMOTION_LABELS}\n\n"
+        'JSON 스키마: {"primary":"", "secondary":"", "reason":"", "trigger_keywords":[...]}'
+    )
+    return system_prompt, user_prompt
+
+
+def summarize_for_style_prompt(conversation: List[Dict[str, str]]) -> Tuple[str, str]:
+    system_prompt = (
+        "당신은 상담 내용을 '추구미 설계'로 넘기기 위한 요약가입니다. "
+        "상담 전체에서 핵심 감정/상황/원하는 변화/제약을 뽑아 5~8줄로 요약하세요. "
+        "반드시 JSON으로만 답하세요."
+    )
+    convo_text = "\n".join([f"{m['role']}: {m['content']}" for m in conversation][-20:])
+    user_prompt = (
+        f"상담 대화(최근 20개):\n{convo_text}\n\n"
+        'JSON 스키마: {"core_emotions":[...], "situation":"", "desired_change":"", "constraints":"", "keywords":[...]}'
+    )
+    return system_prompt, user_prompt
+
+
+def style_report_prompt(
+    style_inputs: Dict[str, Any],
+    counselor_summary: str,
+) -> Tuple[str, str]:
+    system_prompt = (
+        "당신은 '추구미 도우미'입니다. "
+        "사용자의 선택 키워드/텍스트/상황을 바탕으로 추구미 리포트와 실천 가이드를 생성하세요. "
+        "브랜드/제품 추천 금지(방향성만). "
+        "과장하지 말고 구조적으로. 반드시 JSON으로만 답하세요."
+    )
+
+    user_prompt = {
+        "selected_keywords": style_inputs.get("keywords", []),
+        "text_like": style_inputs.get("text_like", ""),
+        "text_dislike": style_inputs.get("text_dislike", ""),
+        "text_constraints": style_inputs.get("text_constraints", ""),
+        "spaces": style_inputs.get("spaces", []),
+        "uploaded_image_analysis": style_inputs.get("uploaded_image_analysis"),
+        "counselor_summary": counselor_summary,
+        "output_schema": {
+            "type_name_ko": "",
+            "type_name_en": "",
+            "identity_one_liner": "",
+            "core_keywords": [],
+            "mini_report": {
+                "mood_summary": "",
+                "impression": "",
+                "best_contexts": [],
+                "watch_out": "",
+                "maintenance_difficulty": "낮음/중간/높음 중 하나",
+            },
+            "apply_strategy_from_counseling": "",
+            "practice_guide": {
+                "makeup": {
+                    "base": "",
+                    "points": {"eyes": "", "lips": ""},
+                    "avoid": "",
+                },
+                "fashion": {
+                    "silhouette": "",
+                    "color_palette": [],
+                    "avoid_colors": [],
+                    "top5_items": [],
+                },
+                "behavior_lifestyle": {
+                    "gesture_tone": "",
+                    "speech_manner": "",
+                    "daily_habits": [],
+                },
+            },
+        },
+    }
+
+    return system_prompt, json.dumps(user_prompt, ensure_ascii=False)
+
+
+def pinterest_query_expander_prompt(
+    chosen_keywords: List[str],
+    spaces: List[str],
+    locale_hint: str = "Korean",
+) -> Tuple[str, str]:
+    system_prompt = (
+        "당신은 Pinterest 검색어 설계자입니다. "
+        "사용자가 선택한 추구미 키워드로 '사람(인물) 이미지'가 잘 나오는 검색어를 만든다. "
+        "Pinterest 검색에 강한 짧은 쿼리로 3~6개를 제안하라. "
+        "한국어/영어 혼합 가능. "
+        "반드시 JSON으로만 답하세요."
+    )
+    user_prompt = (
+        f"키워드: {chosen_keywords}\n"
+        f"적용 공간: {spaces}\n"
+        f"언어 힌트: {locale_hint}\n\n"
+        'JSON 스키마: {"queries":[...], "negative_terms":[...], "note":"..."}\n'
+        "- queries는 3~6개, 각 2~6단어\n"
+        "- 사람/패션/룩/메이크업 중심(예: 'neutral chic outfit', 'clean girl makeup')"
+    )
+    return system_prompt, user_prompt
+
+
+# -----------------------------
+# Sidebar
+# -----------------------------
+with st.sidebar:
+    st.header("⚙️ 설정")
+    openai_key = st.text_input("OpenAI API Key", type="password", value="")
+    pinterest_token = st.text_input("Pinterest Access Token (Bearer)", type="password", value="")
+    st.caption(PINTEREST_NOTE)
+
+    st.divider()
+
+    st.session_state["category"] = st.selectbox("상담/코칭 카테고리", CATEGORIES, index=CATEGORIES.index(st.session_state["category"]))
+    st.session_state["persona"] = st.selectbox("대화 톤", list(PERSONAS.keys()), index=list(PERSONAS.keys()).index(st.session_state["persona"]))
+
+    if st.button("🧹 대화 초기화", use_container_width=True):
+        st.session_state["messages"] = []
+        st.session_state["turn_count"] = 0
+        st.session_state["move_to_style"] = False
+        st.session_state["counsel_summary_for_style"] = ""
+        st.session_state["last_emotion_guess"] = None
+        st.session_state["last_emotion_guess_reason"] = None
+        st.success("초기화 완료!")
+
+    st.divider()
+    st.markdown(PRIVACY_NOTICE)
+
+# -----------------------------
+# Tabs with controlled navigation
+# -----------------------------
+tab_titles = ["🧠 AI 상담사", "📊 감정 트래커", "✨ 추구미 설계"]
+tabs = st.tabs(tab_titles)
+
+# -----------------------------
+# TAB 1: Counselor Chat
+# -----------------------------
+with tabs[0]:
+    st.title("🧠 AI 상담사")
+    st.caption("즉시 공감 + 구체적 행동 제안. 필요하면 자연스럽게 추구미 설계로 연결해요.")
+
+    # render messages
+    for m in st.session_state["messages"]:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+
+    user_input = st.chat_input("지금 어떤 고민이 있나요? (자유롭게 적어주세요)")
+    if user_input:
+        st.session_state["messages"].append({"role": "user", "content": user_input})
+        st.session_state["turn_count"] += 1
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        # crisis handling (no model call)
+        if detect_crisis(user_input):
+            with st.chat_message("assistant"):
+                st.markdown(
+                    "지금 안전이 가장 중요해요.\n\n"
+                    "- **즉시 112/119** 또는 가까운 응급실/전문기관에 도움을 요청해 주세요.\n"
+                    "- 주변에 믿을 수 있는 사람(가족/친구/담당자)에게 **지금 곁에 있어달라고** 말해 주세요.\n\n"
+                    "한 가지만 확인할게요: **지금 혼자 있나요, 아니면 누군가 곁에 있나요?**"
+                )
+            st.session_state["messages"].append(
+                {"role": "assistant", "content": "지금 안전이 가장 중요해요... (안전 안내 및 확인 질문)"}  # minimal log
+            )
+        else:
+            # emotion label (json)
+            if openai_key:
+                try:
+                    sp, up = emotion_label_prompt(user_input)
+                    emo = openai_json(openai_key, sp, up, temperature=0.0)
+                    st.session_state["last_emotion_guess"] = emo.get("primary")
+                    st.session_state["last_emotion_guess_reason"] = emo.get("reason", "")
+                except Exception:
+                    st.session_state["last_emotion_guess"] = None
+                    st.session_state["last_emotion_guess_reason"] = None
+
+            # counselor response
+            with st.chat_message("assistant"):
+                if not openai_key:
+                    st.warning("사이드바에 OpenAI API Key를 입력하면 상담 응답을 받을 수 있어요.")
+                else:
+                    try:
+                        sys_p = counselor_system_prompt(st.session_state["category"], st.session_state["persona"])
+                        assistant_text = openai_stream_chat(openai_key, sys_p, st.session_state["messages"], temperature=0.7)
+                        st.session_state["messages"].append({"role": "assistant", "content": assistant_text})
+
+                        # periodically summarize
+                        if st.session_state["turn_count"] % 7 == 0:
+                            try:
+                                sp2, up2 = summarize_for_style_prompt(st.session_state["messages"])
+                                summ = openai_json(openai_key, sp2, up2, temperature=0.2)
+                                summary_lines = [
+                                    f"- 핵심 감정: {', '.join(summ.get('core_emotions', [])[:3])}",
+                                    f"- 상황: {summ.get('situation','')}",
+                                    f"- 원하는 변화: {summ.get('desired_change','')}",
+                                    f"- 제약/현실: {summ.get('constraints','')}",
+                                ]
+                                st.markdown("#### 🧾 중간 요약")
+                                st.markdown("\n".join(summary_lines))
+                            except Exception:
+                                pass
+
+                    except Exception as e:
+                        st.error(f"오류가 발생했어요: {e}")
+
+            # emotion quick save button
+            if st.session_state["last_emotion_guess"]:
+                col_a, col_b = st.columns([1, 2])
+                with col_a:
+                    if st.button("📌 오늘 감정으로 저장", use_container_width=True):
+                        now = dt.datetime.now()
+                        st.session_state["mood_logs"].append(
+                            {
+                                "ts": now.isoformat(timespec="seconds"),
+                                "date": now.date().isoformat(),
+                                "weekday": now.strftime("%a"),
+                                "mood": "😐",
+                                "mood_name": "보통",
+                                "memo": user_input[:200],
+                                "label": st.session_state["last_emotion_guess"],
+                            }
+                        )
+                        st.success("감정 트래커에 저장했어요!")
+                with col_b:
+                    st.caption(f"추정 감정: **{st.session_state['last_emotion_guess']}** · {st.session_state['last_emotion_guess_reason'] or ''}")
+
+            # style-signal detection => propose transition
+            if detect_style_signal(user_input):
+                st.session_state["move_to_style"] = True
+
+            if st.session_state["move_to_style"] and openai_key:
+                # build counselor summary for tab3
+                if not st.session_state["counsel_summary_for_style"]:
+                    try:
+                        sp3, up3 = summarize_for_style_prompt(st.session_state["messages"])
+                        summ2 = openai_json(openai_key, sp3, up3, temperature=0.2)
+                        st.session_state["counsel_summary_for_style"] = (
+                            "핵심 감정: " + ", ".join(summ2.get("core_emotions", [])[:3]) + "\n"
+                            "상황: " + (summ2.get("situation", "") or "") + "\n"
+                            "원하는 변화: " + (summ2.get("desired_change", "") or "") + "\n"
+                            "제약: " + (summ2.get("constraints", "") or "")
+                        )
+                    except Exception:
+                        st.session_state["counsel_summary_for_style"] = ""
+
+                st.info("추구미(이미지 정체성) 쪽으로 이어가도 괜찮을까요?")
+                if st.button("✨ 추구미 설계 시작", use_container_width=True):
+                    st.session_state["active_tab"] = 2
+                    st.rerun()
+
+# -----------------------------
+# TAB 2: Mood Tracker
+# -----------------------------
+with tabs[1]:
+    st.title("📊 감정 트래커")
+    st.caption("오늘 기분을 기록하고, 패턴을 가볍게 확인해요.")
+
+    col1, col2 = st.columns([1, 2])
+
+    with col1:
+        st.subheader("📝 오늘 기록")
+        mood_emoji = st.selectbox("기분(이모지)", [m[0] for m in MOOD_CHOICES], index=2)
+        mood_name = dict(MOOD_CHOICES).get(mood_emoji, "보통")
+        memo = st.text_area("짧은 메모", placeholder="무슨 일이 있었나요? (선택)", height=120)
+        label = st.selectbox("감정 라벨(선택)", ["(자동/미선택)"] + EMOTION_LABELS, index=0)
+
+        if st.button("✅ 저장", use_container_width=True):
+            now = dt.datetime.now()
+            st.session_state["mood_logs"].append(
+                {
+                    "ts": now.isoformat(timespec="seconds"),
+                    "date": now.date().isoformat(),
+                    "weekday": now.strftime("%a"),
+                    "mood": mood_emoji,
+                    "mood_name": mood_name,
+                    "memo": (memo or "").strip()[:400],
+                    "label": "" if label == "(자동/미선택)" else label,
+                }
+            )
+            st.success("저장했어요!")
 
         st.divider()
-        st.markdown("### 🔁 팔로업(대화 기억 & 조정)")
-        st.caption("추구미는 환경에 따라 조정될 수 있어요. 변화가 있으면 업데이트 제안을 만들어요.")
-        user_update = st.text_input("환경 변화/상황 변화(선택)", placeholder=st.session_state.followup_question)
-        if st.button("🧩 변화 반영해 조정안 만들기"):
-            if not user_update.strip():
-                st.warning("변화 내용을 한 줄이라도 적어줘요.")
-            else:
-                client = get_client()
-                input_items = [{
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": "아래 추구미 요약과 변화 내용을 반영해 '조정안'만 간결하게 만들어줘."},
-                        {"type": "input_text", "text": f"추구미 요약:\n{st.session_state.last_profile_summary}"},
-                        {"type": "input_text", "text": f"변화 내용:\n{user_update.strip()}"},
-                    ],
-                }]
-                with st.spinner("조정안 생성 중..."):
-                    try:
-                        tweak = stream_response_text(
-                            client,
-                            "당신은 추구미 설계 AI입니다. 출력: 1) 유지할 것 2) 바꿀 것 3) 이번 주 실험 2개. 브랜드/제품 금지.",
-                            input_items,
-                        )
-                    except Exception as e:
-                        st.error(f"OpenAI API 오류: {e}")
-                        st.stop()
-                st.markdown("#### ✅ 조정안")
-                st.markdown(tweak)
+        st.markdown("🧘 마음 안정 콘텐츠(간단)")
+        if st.button("🌬️ 60초 호흡 가이드", use_container_width=True):
+            st.markdown(
+                "- 4초 들이마시기\n"
+                "- 4초 멈추기\n"
+                "- 6초 내쉬기\n"
+                "- 2초 멈추기\n\n"
+                "이 사이클을 5번 반복해 보세요."
+            )
 
-# =========================
-# TAB 3: Photo-based fit feedback (5. 사용자 스타일 피드백)
-# =========================
-with tabs[2]:
-    st.subheader("③ 사용자 스타일 피드백(사진 기반)")
-    st.caption("본인 사진을 업로드하면, **현재 추구미 기준으로** 일치도와 개선점을 제공합니다.")
-
-    if not st.session_state.style_report.strip() and not st.session_state.last_profile_summary.strip():
-        st.info("먼저 ② 탭에서 추구미 리포트를 생성하면 더 정확하게 피드백할 수 있어요.")
-    else:
-        st.success("추구미 기준이 준비됐어요. 사진을 올려 주세요.")
-
-    my_photo = st.file_uploader(
-        "내 스타일 사진 업로드(상반신/전신/메이크업 등)",
-        type=["png", "jpg", "jpeg", "webp"],
-        accept_multiple_files=False,
-        key="my_photo",
-    )
-
-    run_fit = st.button("📌 내 사진을 추구미 기준으로 피드백", use_container_width=True)
-
-    if run_fit:
-        if my_photo is None:
-            st.warning("사진을 1장 업로드해 주세요.")
-            st.stop()
-
-        client = get_client()
-        mime = my_photo.type or "image/jpeg"
-        data_url = b64_data_url(my_photo.getvalue(), mime)
-
-        # 추구미 기준 텍스트(리포트 전체를 넣으면 길 수 있어 요약을 우선 사용)
-        basis = st.session_state.last_profile_summary.strip() or st.session_state.style_report[:800]
-
-        content_parts = [
-            {"type": "input_text", "text": "아래 '추구미 기준'과 업로드된 '내 사진'을 바탕으로 적합성 피드백을 작성해줘."},
-            {"type": "input_text", "text": f"추구미 기준(요약):\n{basis}"},
-            {"type": "input_image", "image_url": data_url},
-        ]
-        input_items = [{"role": "user", "content": content_parts}]
-
-        with st.spinner("사진 기반 피드백 생성 중..."):
-            try:
-                fb = stream_response_text(client, FIT_FEEDBACK_SYSTEM, input_items)
-            except Exception as e:
-                st.error(f"OpenAI API 오류: {e}")
-                st.stop()
-
-        st.session_state.fit_feedback = fb
-        st.rerun()
-
-    if st.session_state.fit_feedback:
-        st.markdown("### ✅ 추구미 적합성 피드백")
-        st.markdown(st.session_state.fit_feedback)
-
-# =========================
-# TAB 4: Tracker (6. 유지 & 성장 관리)
-# =========================
-with tabs[3]:
-    st.subheader("④ 추구미 트래커(유지 & 성장 관리)")
-    st.caption("오늘의 스타일이 추구미와 얼마나 맞았는지 기록하고, 패턴을 봅니다.")
-
-    col1, col2, col3 = st.columns([1, 2, 2])
-    with col1:
-        fit_choice = st.selectbox("오늘의 스타일", ["잘 맞음", "애매", "어긋남"], index=1)
     with col2:
-        situation = st.text_input("상황/공간(선택)", placeholder="예: 학교 수업 / 데이트 / 발표 / 실습 / 면접")
-    with col3:
-        memo = st.text_input("짧은 메모(선택)", placeholder="예: 단정했지만 너무 딱딱해 보였다는 피드백")
+        st.subheader("📚 기록 목록")
+        if not st.session_state["mood_logs"]:
+            st.info("아직 기록이 없어요. 왼쪽에서 저장해 보세요.")
+        else:
+            df = pd.DataFrame(st.session_state["mood_logs"])
+            df_show = df[["date", "weekday", "mood", "mood_name", "label", "memo"]].copy()
+            st.dataframe(df_show, use_container_width=True, hide_index=True)
 
-    if st.button("📝 기록 저장", use_container_width=True):
-        st.session_state.style_logs.append(
-            {
-                "ts": now_kst_str(),
-                "fit": fit_choice,
-                "situation": situation.strip(),
-                "memo": memo.strip(),
-            }
+            st.subheader("📈 요일별 기분 분포(간단)")
+            mood_rank = {name: i for i, name in enumerate(["슬픔", "불안", "분노", "지침", "허무", "보통", "괜찮음", "좋음", "설렘"], start=1)}
+            # use mood_name as proxy score
+            df_score = df.copy()
+            df_score["score"] = df_score["mood_name"].map({"슬픔": 2, "불안": 3, "분노": 3, "지침": 3, "보통": 5, "괜찮음": 6, "좋음": 7, "설렘": 8}).fillna(5)
+            order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+            df_score["weekday"] = pd.Categorical(df_score["weekday"], categories=order, ordered=True)
+
+            chart = (
+                alt.Chart(df_score)
+                .mark_bar()
+                .encode(
+                    x=alt.X("weekday:N", title="요일"),
+                    y=alt.Y("mean(score):Q", title="평균 기분(대략)"),
+                    tooltip=["weekday", alt.Tooltip("mean(score):Q", title="평균")],
+                )
+                .properties(height=220)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+            st.subheader("🔎 인사이트(키워드 요약)")
+            text_blob = " ".join([str(x) for x in df["memo"].tolist() if x])
+            tokens = re.findall(r"[가-힣A-Za-z0-9]{2,}", text_blob)
+            common = [w for w, c in Counter(tokens).most_common(10)]
+            if common:
+                st.markdown("자주 등장한 단어: " + ", ".join([f"`{w}`" for w in common]))
+                st.caption("반복적으로 힘들다면(예: 특정 주기/상황), 전문가 상담을 **가능성**으로 고려해도 좋아요. (진단은 불가)")
+            else:
+                st.caption("메모가 쌓이면 키워드 인사이트가 더 잘 보여요.")
+
+# -----------------------------
+# TAB 3: Style Identity ("추구미") + Pinterest + Image analysis
+# -----------------------------
+with tabs[2]:
+    st.title("✨ 추구미 도우미 - 당신을 브랜딩하는 첫걸음, 추구미")
+    st.caption("선택 키워드 + 텍스트 + (선택) 이미지로 추구미 리포트를 만들고, Pinterest 이미지 참고도 붙여요.")
+
+    # Auto-inject counseling summary if moved
+    if st.session_state.get("counsel_summary_for_style"):
+        st.info("✅ 상담 탭의 요약이 자동 전달됐어요.")
+        st.text_area(
+            "상담 요약(자동)",
+            value=st.session_state["counsel_summary_for_style"],
+            height=110,
+            disabled=True,
         )
-        st.success("저장했어요!")
-        st.rerun()
 
-    df = pd.DataFrame(st.session_state.style_logs) if st.session_state.style_logs else pd.DataFrame(
-        columns=["ts", "fit", "situation", "memo"]
+    st.subheader("1) 무드/스타일 선택 (5~10개)")
+    selected = st.multiselect(
+        "끌리는 키워드를 골라주세요",
+        STYLE_KEYWORDS,
+        default=st.session_state["style_inputs"].get("keywords", []),
+        max_selections=10,
     )
+    st.session_state["style_inputs"]["keywords"] = selected
+
+    st.subheader("2) 텍스트 보조 입력")
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.session_state["style_inputs"]["text_like"] = st.text_area(
+            "내가 좋아하는 스타일을 구체적으로 적어보아요.",
+            value=st.session_state["style_inputs"].get("text_like", ""),
+            placeholder="예: 편해 보이는데 세련됐으면 / 피부 표현은 깨끗하게",
+            height=120,
+        )
+    with col_b:
+        st.session_state["style_inputs"]["text_dislike"] = st.text_area(
+            "이런 느낌은 싫어요",
+            value=st.session_state["style_inputs"].get("text_dislike", ""),
+            placeholder="예: 너무 꾸민 느낌 / 과한 펄",
+            height=120,
+        )
+    with col_c:
+        st.session_state["style_inputs"]["text_constraints"] = st.text_area(
+            "현실 제약/조건(선택)",
+            value=st.session_state["style_inputs"].get("text_constraints", ""),
+            placeholder="예: 학교에서 무난해야 함 / 예산 제한 / 관리 시간 적음",
+            height=120,
+        )
+
+    st.subheader("3) (선택) 사진 업로드 — 추구미 분위기 분석")
+    up = st.file_uploader("좋다고 느꼈던 이미지가 있으면 올려주세요 (jpg/png)", type=["jpg", "jpeg", "png"])
+    if up is not None:
+        img_bytes = up.read()
+        st.session_state["style_inputs"]["uploaded_image_bytes"] = img_bytes
+        st.session_state["style_inputs"]["uploaded_image_name"] = up.name
+        st.image(img_bytes, caption=f"업로드: {up.name}", use_container_width=True)
+
+        if st.button("🧠 업로드 이미지로 추구미 키워드 추정", use_container_width=True):
+            if not openai_key:
+                st.warning("OpenAI API Key를 입력하면 이미지 분석을 할 수 있어요.")
+            else:
+                with st.spinner("이미지 분위기를 분석 중..."):
+                    try:
+                        analysis = openai_vision_analyze_style(openai_key, img_bytes, STYLE_KEYWORDS)
+                        st.session_state["style_inputs"]["uploaded_image_analysis"] = analysis
+                        st.success("이미지 기반 키워드 추정 완료!")
+                    except Exception as e:
+                        st.error(f"이미지 분석 오류: {e}")
+
+    if st.session_state["style_inputs"].get("uploaded_image_analysis"):
+        a = st.session_state["style_inputs"]["uploaded_image_analysis"]
+        st.markdown("#### 🖼️ 이미지 분석 결과(참고)")
+        st.markdown(f"- 추정 키워드: **{', '.join(a.get('keywords', []))}**")
+        if a.get("rationale"):
+            st.caption(a["rationale"])
+        if a.get("warnings"):
+            st.warning(a["warnings"])
+
+        if st.button("➕ 이미지 키워드를 선택 키워드에 합치기", use_container_width=True):
+            merged = list(dict.fromkeys(st.session_state["style_inputs"]["keywords"] + a.get("keywords", [])))
+            st.session_state["style_inputs"]["keywords"] = merged[:10]
+            st.rerun()
+
+    st.subheader("4) 적용 공간 선택")
+    spaces = st.multiselect(
+        "어떤 공간/상황에서 이 추구미를 주로 쓰고 싶나요?",
+        SPACE_CHOICES,
+        default=st.session_state["style_inputs"].get("spaces", []),
+    )
+    st.session_state["style_inputs"]["spaces"] = spaces
 
     st.divider()
-    st.markdown("### 🗂️ 기록")
-    st.dataframe(df, use_container_width=True)
 
-    st.divider()
-    st.markdown("### 📈 패턴")
-    if df.empty:
-        st.info("기록이 쌓이면 요일/상황별 패턴을 보여줄게요.")
+    # Pinterest integration
+    st.subheader("🧷 Pinterest 참고 이미지(인물 이미지 검색)")
+    st.caption("선택한 추구미 키워드로 Pinterest에서 참고 이미지를 가져옵니다(권한/토큰 필요).")
+
+    if not pinterest_token:
+        st.info("사이드바에 Pinterest Access Token을 입력하면 Pinterest 이미지를 붙일 수 있어요.")
     else:
-        # 간단 점수화
-        score_map = {"잘 맞음": 3, "애매": 2, "어긋남": 1}
-        tmp = df.copy()
-        tmp["score"] = tmp["fit"].map(score_map).fillna(2)
+        colp1, colp2 = st.columns([2, 1])
+        with colp1:
+            manual_term = st.text_input("직접 검색어(선택)", value=st.session_state.get("pinterest_last_term", ""))
+        with colp2:
+            st.write("")
+            st.write("")
+            auto_expand = st.checkbox("🤖 AI로 검색어 추천", value=True)
 
-        # 날짜 파생(로컬 시간 기준)
-        tmp["date"] = pd.to_datetime(tmp["ts"]).dt.date.astype(str)
+        suggested_queries = []
+        negative_terms = []
+        if auto_expand and openai_key and st.session_state["style_inputs"]["keywords"]:
+            if st.button("🔎 검색어 추천 만들기", use_container_width=True):
+                try:
+                    spx, upx = pinterest_query_expander_prompt(
+                        st.session_state["style_inputs"]["keywords"],
+                        st.session_state["style_inputs"]["spaces"],
+                        locale_hint="Korean + English mix",
+                    )
+                    qq = openai_json(openai_key, spx, upx, temperature=0.2)
+                    suggested_queries = qq.get("queries", [])[:6]
+                    negative_terms = qq.get("negative_terms", [])[:6]
+                    st.session_state["pinterest_suggested_queries"] = suggested_queries
+                    st.session_state["pinterest_negative_terms"] = negative_terms
+                except Exception as e:
+                    st.error(f"검색어 추천 오류: {e}")
 
-        st.markdown("**날짜별 추구미 적합 점수(평균)**")
-        agg = tmp.groupby("date", as_index=False)["score"].mean().sort_values("date")
-        st.line_chart(agg.set_index("date")["score"])
+        suggested_queries = st.session_state.get("pinterest_suggested_queries", []) or suggested_queries
+        negative_terms = st.session_state.get("pinterest_negative_terms", []) or negative_terms
 
-        st.markdown("**상황 키워드(간단)**")
-        # 상황 텍스트에서 상위 키워드 간단 추출(룰 기반)
-        text = " ".join(tmp["situation"].fillna("").tolist())
-        candidates = [w for w in ["학교", "직장", "데이트", "SNS", "공식", "발표", "면접", "실습", "모임"] if w in text]
-        st.write(", ".join(candidates) if candidates else "상황 키워드가 아직 뚜렷하지 않아요. 상황을 조금만 더 구체적으로 적어보세요!")
+        if suggested_queries:
+            st.markdown("**추천 검색어:** " + " · ".join([f"`{q}`" for q in suggested_queries]))
+        if negative_terms:
+            st.caption("제외(참고): " + ", ".join([f"`{q}`" for q in negative_terms]))
 
-# =========================
-# Footer
-# =========================
-st.divider()
-st.caption(
-    "안내: 본 앱은 진단/치료 목적이 아니며, 외모 평가를 하지 않습니다. "
-    "추구미(이미지 정체성) 기준에서의 '적합성'만 다룹니다."
-)
+        term_to_search = manual_term.strip()
+        if not term_to_search and suggested_queries:
+            term_to_search = suggested_queries[0]
+
+        cols_btn = st.columns([1, 1, 2])
+        with cols_btn[0]:
+            do_search = st.button("📌 Pinterest 검색", use_container_width=True)
+        with cols_btn[1]:
+            clear_cache = st.button("🧽 Pinterest 캐시 비우기", use_container_width=True)
+        with cols_btn[2]:
+            st.caption("※ /search/partner/pins는 베타라 403이면 사용 불가 안내가 나옵니다.")
+
+        if clear_cache:
+            st.session_state["pinterest_cache"] = {}
+            st.success("캐시를 비웠어요!")
+
+        pins = []
+        if do_search:
+            if not term_to_search:
+                st.warning("검색어를 입력하거나(또는 추천 검색어 생성) 진행해 주세요.")
+            else:
+                st.session_state["pinterest_last_term"] = term_to_search
+                cache = st.session_state["pinterest_cache"]
+                if term_to_search in cache:
+                    pins = cache[term_to_search]
+                else:
+                    with st.spinner("Pinterest에서 핀을 불러오는 중..."):
+                        try:
+                            data = pinterest_search_partner_pins(
+                                pinterest_token,
+                                term_to_search,
+                                country_code="KR",
+                                locale="ko-KR",
+                                limit=12,
+                            )
+                            items = data.get("items", []) or []
+                            # normalize minimal fields
+                            norm = []
+                            for it in items:
+                                media = it.get("media") or {}
+                                img_url = pinterest_best_image_url(media)
+                                norm.append(
+                                    {
+                                        "id": it.get("id"),
+                                        "title": it.get("title") or "",
+                                        "description": it.get("description") or "",
+                                        "link": it.get("link") or "",
+                                        "img": img_url,
+                                        "alt_text": it.get("alt_text") or "",
+                                    }
+                                )
+                            pins = norm
+                            cache[term_to_search] = pins
+                            st.session_state["pinterest_cache"] = cache
+                        except Exception as e:
+                            st.error(
+                                "Pinterest API에서 핀을 가져오지 못했어요.\n\n"
+                                f"- 사유: {e}\n\n"
+                                "가능한 원인:\n"
+                                "- 이 앱/토큰이 `GET /v5/search/partner/pins`(베타) 권한이 없음\n"
+                                "- 토큰 만료/스코프 부족\n"
+                                "- 레이트리밋/네트워크\n"
+                            )
+
+        if not pins and term_to_search in st.session_state["pinterest_cache"]:
+            pins = st.session_state["pinterest_cache"][term_to_search]
+
+        if pins:
+            st.markdown(f"#### 결과: `{term_to_search}`")
+            c1, c2, c3 = st.columns(3)
+            cols = [c1, c2, c3]
+            for i, p in enumerate(pins):
+                with cols[i % 3]:
+                    if p.get("img"):
+                        # clickable image via HTML
+                        link = p.get("link") or "https://www.pinterest.com/"
+                        title = (p.get("title") or "").strip() or "Pinterest Pin"
+                        st.markdown(
+                            f"""
+                            <a href="{link}" target="_blank" style="text-decoration:none;">
+                                <img src="{p["img"]}" style="width:100%; border-radius:14px; margin-bottom:6px;" />
+                            </a>
+                            <div style="font-weight:700; margin-bottom:8px;">{title}</div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.info("이미지 URL이 없는 핀이에요.")
+                    with st.expander("상세"):
+                        if p.get("description"):
+                            st.write(p["description"])
+                        if p.get("alt_text"):
+                            st.caption(p["alt_text"])
+                        if p.get("link"):
+                            st.link_button("Pinterest에서 열기", p["link"])
+
+    st.divider()
+
+    # Generate style report
+    st.subheader("🧾 추구미 분석 & 리포트")
+    can_run = len(st.session_state["style_inputs"]["keywords"]) >= 5 and len(st.session_state["style_inputs"]["keywords"]) <= 10
+
+    colr1, colr2 = st.columns([1, 2])
+    with colr1:
+        if st.button("✨ 추구미 분석", use_container_width=True, disabled=not can_run):
+            if not openai_key:
+                st.warning("OpenAI API Key를 입력해 주세요.")
+            else:
+                with st.spinner("추구미 리포트를 생성 중..."):
+                    try:
+                        sys_p, user_p = style_report_prompt(
+                            st.session_state["style_inputs"],
+                            st.session_state.get("counsel_summary_for_style", ""),
+                        )
+                        report = openai_json(openai_key, sys_p, user_p, temperature=0.4)
+                        st.session_state["style_report"] = report
+                        st.success("리포트 생성 완료!")
+                    except Exception as e:
+                        st.error(f"리포트 생성 오류: {e}")
+
+        st.caption("조건: 키워드 5~10개 선택")
+    with colr2:
+        st.caption("※ 사진 업로드가 있어도, 현재는 '이미지 내용' 자체를 저장/추적하지 않고 분석 결과(키워드/근거)만 참고합니다.")
+
+    if st.session_state.get("style_report"):
+        r = st.session_state["style_report"]
+        st.markdown(f"## 💎 타입: **{r.get('type_name_ko','')}**  \n**{r.get('type_name_en','')}**")
+        st.markdown(f"**한 문장 정체성:** {r.get('identity_one_liner','')}")
+        st.markdown("**핵심 키워드:** " + ", ".join([f"`{k}`" for k in (r.get("core_keywords") or [])]))
+
+        if st.session_state.get("counsel_summary_for_style") and r.get("apply_strategy_from_counseling"):
+            st.markdown("### 🧩 현재 고민을 반영한 적용 전략")
+            st.write(r["apply_strategy_from_counseling"])
+
+        st.markdown("### 📌 미니 리포트")
+        mini = r.get("mini_report", {}) or {}
+        st.markdown(f"- 분위기 요약: {mini.get('mood_summary','')}")
+        st.markdown(f"- 타인 인상: {mini.get('impression','')}")
+        if mini.get("best_contexts"):
+            st.markdown("- 어울리는 상황: " + ", ".join([f"`{x}`" for x in mini.get("best_contexts", [])]))
+        st.markdown(f"- 과도함 주의: {mini.get('watch_out','')}")
+        st.markdown(f"- 유지 난이도: **{mini.get('maintenance_difficulty','')}**")
+
+        st.markdown("### 🪞 실천 가이드 (방향성)")
+        guide = r.get("practice_guide", {}) or {}
+
+        m = guide.get("makeup", {}) or {}
+        f = guide.get("fashion", {}) or {}
+        b = guide.get("behavior_lifestyle", {}) or {}
+
+        cga, cgb = st.columns(2)
+        with cga:
+            st.markdown("#### 💄 메이크업")
+            st.markdown(f"- 베이스: {m.get('base','')}")
+            pts = m.get("points", {}) or {}
+            st.markdown(f"- 눈: {pts.get('eyes','')}")
+            st.markdown(f"- 입술: {pts.get('lips','')}")
+            st.markdown(f"- 피하면 좋은 요소: {m.get('avoid','')}")
+        with cgb:
+            st.markdown("#### 👗 패션")
+            st.markdown(f"- 실루엣: {f.get('silhouette','')}")
+            if f.get("color_palette"):
+                st.markdown("- 컬러 팔레트: " + ", ".join([f"`{x}`" for x in f.get("color_palette", [])]))
+            if f.get("avoid_colors"):
+                st.markdown("- 피할 컬러: " + ", ".join([f"`{x}`" for x in f.get("avoid_colors", [])]))
+            if f.get("top5_items"):
+                st.markdown("- 기본 아이템 Top5:\n" + "\n".join([f"  - {x}" for x in f.get("top5_items", [])]))
+
+        st.markdown("#### 🧍 행동/라이프스타일")
+        st.markdown(f"- 제스처/톤: {b.get('gesture_tone','')}")
+        st.markdown(f"- 말투/매너: {b.get('speech_manner','')}")
+        if b.get("daily_habits"):
+            st.markdown("- 작은 습관:\n" + "\n".join([f"  - {x}" for x in b.get("daily_habits", [])]))
+
+        st.divider()
+        st.subheader("📷 사용자 사진 업로드(다음 단계)")
+        st.caption("현재는 사진 '내용'을 분석하지 않습니다. 대신 체크리스트를 만들어드려요.")
+        u2 = st.file_uploader("화장/스타일 사진 업로드(UI만)", type=["jpg", "jpeg", "png"], key="future_photo")
+        if u2 is not None:
+            st.success("업로드 완료! (현재 단계에서는 이미지 내용은 보지 않아요.)")
+            if st.button("✅ 추구미 기준 체크리스트 생성", use_container_width=True):
+                if not openai_key:
+                    st.warning("OpenAI API Key를 입력해 주세요.")
+                else:
+                    with st.spinner("체크리스트 생성 중..."):
+                        try:
+                            sp = (
+                                "당신은 추구미 스타일 코치입니다. "
+                                "사용자가 목표로 한 추구미 리포트를 바탕으로, "
+                                "사용자 사진을 '보지 않는다'는 전제에서 점검 체크리스트를 작성하세요. "
+                                "반드시 (1)잘된 점 체크 (2)개선점 체크 (3)대체 방향 제시로 구성. "
+                                "JSON이 아니라 일반 텍스트로 간결하게."
+                            )
+                            uprompt = (
+                                "추구미 리포트 요약:\n"
+                                f"- 타입: {r.get('type_name_ko','')} / {r.get('type_name_en','')}\n"
+                                f"- 한줄 정의: {r.get('identity_one_liner','')}\n"
+                                f"- 핵심 키워드: {', '.join(r.get('core_keywords') or [])}\n"
+                                f"- 메이크업: {json.dumps(m, ensure_ascii=False)}\n"
+                                f"- 패션: {json.dumps(f, ensure_ascii=False)}\n\n"
+                                "요청: 사진을 보지 않는 조건에서, 사용자가 스스로 점검할 체크리스트를 만들어줘."
+                            )
+                            # stream as normal (single placeholder)
+                            with st.chat_message("assistant"):
+                                txt = openai_stream_chat(
+                                    openai_key,
+                                    sp,
+                                    [{"role": "user", "content": uprompt}],
+                                    temperature=0.4,
+                                )
+                                st.session_state["style_self_checklist"] = txt
+                        except Exception as e:
+                            st.error(f"체크리스트 오류: {e}")
+
+        if st.session_state.get("style_self_checklist"):
+            st.markdown("### 🧾 체크리스트")
+            st.markdown(st.session_state["style_self_checklist"])
+
+# -----------------------------
+# Controlled tab jump (rerun-based)
+# -----------------------------
+if st.session_state.get("active_tab", 0) != 0:
+    # We can't directly programmatically switch st.tabs reliably,
+    # so we use rerun hint + user experience (most Streamlit versions).
+    # If user clicked "추구미 설계 시작", we already reran.
+    pass
