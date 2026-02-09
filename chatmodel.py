@@ -80,7 +80,7 @@ def init_state():
         "pinterest_negative_terms": [],
         "working_model": None,
         "working_image_model": None,
-        "outfit_images": [],  # [{title, b64, prompt}]
+        "outfit_images": [],  # [{title, b64, prompt, model}]
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -481,12 +481,7 @@ def style_report_prompt(style_inputs: Dict[str, Any]) -> Tuple[str, str]:
                 "behavior_lifestyle": {"gesture_tone": "", "speech_manner": "", "daily_habits": []},
             },
             "outfit_examples": [
-                {
-                    "title": "",
-                    "items": ["", "", ""],
-                    "point": "",
-                    "palette_refs": ["charcoal", "ivory"],
-                }
+                {"title": "", "items": ["", "", ""], "point": "", "palette_refs": ["charcoal", "ivory"]}
             ],
         },
         "rules": [
@@ -517,22 +512,39 @@ def pinterest_query_expander_prompt(chosen_keywords: List[str]) -> Tuple[str, st
 
 
 def style_chat_system_prompt() -> str:
+    # ✅ 더 구체적인 해결책을 유도하도록 '코치 룰'을 강화
     return """
 당신은 '추구미(이미지 정체성) 코치'입니다.
 
-원칙:
+핵심 원칙:
 - 두괄식, 과장 금지, 실행 가능한 제안 위주
 - 브랜드/제품명 추천 금지(방향성, 기준, 체크리스트만)
-- 사용자가 고른 키워드(5~10개)를 중심으로 정리
+- 사용자가 고른 키워드(3~7개)를 중심으로 정리
 - 사용자가 싫다고 한 요소/제약조건을 우선 반영
-- 답변은 한국어, 너무 길지 않게(문단 3~6개)
-- 필요할 때만 질문 1개
+- 답변은 한국어, 너무 길지 않게(문단 4~7개)
 
-출력 가이드:
-1) 한 줄 요약(현재 추구미 방향)
-2) 핵심 기준 3개(무엇을 하면 그 분위기가 유지되는지)
-3) 메이크업/패션/태도 중 2~3개 영역에서 바로 적용 팁
-4) 마지막에 질문 1개(정밀도 올릴 때만)
+"단순한 해결책"을 피하기 위한 코칭 규칙(매 답변에 적용):
+1) 사용자의 목표를 1문장으로 재정의(정확히 무엇을 '유지/강화/피하기'인지)
+2) 실패하는 흔한 원인 2~3개를 먼저 짚기(예: 톤/질감/비율/포인트 과잉 등)
+3) 바로 적용 가능한 해결책을 "레벨별"로 제시
+   - Level 1: 오늘 당장 할 수 있는 3가지(시간 3분~10분)
+   - Level 2: 주 2~3회 루틴 3가지(관리/연습)
+   - Level 3: 한 달 플랜 2가지(체계화/일관성)
+4) 답변에 반드시 포함할 구체 요소(최소 6개 이상):
+   - (메이크업) 질감/광/윤곽/눈·입 밸런스 중 최소 2개
+   - (헤어) 실루엣/정돈/볼륨 중 최소 1개
+   - (패션) 핏/소재/컬러/레이어링 중 최소 2개
+   - (태도) 말투·속도·시선·제스처 중 최소 1개
+5) 마지막에 "확인 질문 1개"만(정밀도 올릴 때만)
+6) 사용자가 '무엇을 조심해야 해?'라고 물으면:
+   - 금지 리스트(Do-not) 5개 + 대체안(Instead) 5개를 반드시 제시
+
+출력 형식(권장):
+- 한 줄 요약(현재 추구미 방향)
+- 핵심 기준 3개(지켜야 할 룰)
+- 해결책 Level 1 / Level 2 / Level 3
+- Do-not vs Instead (필요 시)
+- 마지막 질문 1개(선택)
 """.strip()
 
 
@@ -591,16 +603,16 @@ with st.sidebar:
 # -----------------------------
 st.title("🫧이미지 레시피 - 직접 설계하는 내 이미지")
 
-# 1) 키워드 선택 (5~10)
-st.subheader("1) 무드/스타일 선택 (5~10개)")
+# 1) 키워드 선택 (3~7) ✅ 변경
+st.subheader("1) 무드/스타일 선택 (3~7개)")
 selected = st.multiselect(
     "끌리는 키워드를 골라주세요",
     STYLE_KEYWORDS,
     default=st.session_state["style_inputs"].get("keywords", []),
-    max_selections=10,
+    max_selections=7,  # ✅ 변경
 )
 st.session_state["style_inputs"]["keywords"] = selected
-st.caption("※ 최소 5개, 최대 10개를 선택해 주세요.")
+st.caption("※ 최소 3개, 최대 7개를 선택해 주세요.")  # ✅ 변경
 
 # 2) 추가 정보 입력
 st.subheader("2) 추가 정보를 입력해주세요")
@@ -664,7 +676,7 @@ if st.session_state["style_inputs"].get("uploaded_image_analysis"):
 
     if st.button("➕ 이미지 키워드를 선택 키워드에 합치기", use_container_width=True):
         merged = list(dict.fromkeys(st.session_state["style_inputs"]["keywords"] + a.get("keywords", [])))
-        st.session_state["style_inputs"]["keywords"] = merged[:10]
+        st.session_state["style_inputs"]["keywords"] = merged[:7]  # ✅ 변경(최대 7)
         st.rerun()
 
 st.divider()
@@ -810,7 +822,7 @@ st.divider()
 # 추구미 리포트 생성
 # -----------------------------
 st.subheader("🧾 추구미 분석 & 리포트")
-can_run = 5 <= len(st.session_state["style_inputs"]["keywords"]) <= 10
+can_run = 3 <= len(st.session_state["style_inputs"]["keywords"]) <= 7  # ✅ 변경
 
 colr1, colr2 = st.columns([1, 2])
 with colr1:
@@ -835,7 +847,7 @@ with colr1:
                 except Exception as e:
                     st.error(f"리포트 생성 오류: {e}")
 
-    st.caption("조건: 키워드 5~10개 선택")
+    st.caption("조건: 키워드 3~7개 선택")  # ✅ 변경
 with colr2:
     st.caption("※ 사진 업로드가 있어도, 현재는 이미지 원본을 저장하지 않고 분석 결과(키워드/근거)만 참고합니다.")
 
