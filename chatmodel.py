@@ -39,6 +39,11 @@ STYLE_KEYWORDS = [
     "단정한",
 ]
 
+PRIVACY_NOTICE = (
+    "⚠️ **고지**: 이 앱은 의료/심리 **진단**을 제공하지 않습니다. "
+    "자해/자살 등 위기 상황이 있거나 안전이 우려되면, 즉시 112/119 또는 "
+    "가까운 응급실/전문기관의 도움을 받으세요."
+)
 
 PINTEREST_NOTE = (
     "ℹ️ Pinterest API는 **OAuth Access Token(베어러 토큰)** 기반입니다. "
@@ -1033,4 +1038,3 @@ if user_msg:
                 st.caption(f"사용 모델: {used_model}")
             except Exception as e:
                 st.error(f"챗봇 오류: {e}")
-
